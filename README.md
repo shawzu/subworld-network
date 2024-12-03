@@ -1,3 +1,3 @@
 # Subworld-Network
 
-Client written in React Native
+writtend in Go 
