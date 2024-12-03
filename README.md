@@ -1,3 +1,3 @@
 # Subworld-Network
 
-writtend in Go 
+written in Go 
