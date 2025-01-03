@@ -1,17 +1,16 @@
 # Subworld Network
 
-Subworld Network is a decentralized, secure messaging platform designed to ensure maximum privacy and minimal metadata exposure. You can run your own node by following these steps : 
-
-## Prerequisites
-
-- [Docker](https://www.docker.com/get-started)
+Subworld Network is a decentralized, secure messaging platform designed to ensure maximum privacy and minimal metadata exposure. 
 
 
-## Quick Start
+If bootstrap node : 
 
-1. Clone the repository:
 ```bash
-   git clone https://github.com/shawzu/subworld-network.git
-   cd subworld-network
+   go run main.go -bootstrap
 ```
 
+If non-bootstrap node : 
+
+```bash
+   go run main.go -bootstrapNode [bootstrap-node-address]:8080
+```
