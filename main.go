@@ -1,66 +1,72 @@
 package main
 
 import (
-	"flag"
+	"bufio"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	"os"
+	"os/signal"
 	"subworld-network/internal/network"
-	"time"
+	"syscall"
+)
+
+// Configuration parameters
+var (
+	// List of bootstrap node IPs (without port)
+	bootstrapNodes = []string{
+		"93.4.27.35", // Primary bootstrap node
+	}
 )
 
 func main() {
-	isBootstrap := flag.Bool("bootstrap", false, "Run as a bootstrap node")
-	bootstrapNode := flag.String("bootstrapNode", "bootstrap-node-address:8080", "Bootstrap node address")
-	flag.Parse()
+	fmt.Println("Starting Subworld Network node...")
 
-	node, err := network.NewNode(*isBootstrap, *bootstrapNode)
+	// Create a node with our configuration
+	config := network.NodeConfig{
+		BootstrapNodes: bootstrapNodes,
+	}
+
+	node, err := network.NewNode(config)
 	if err != nil {
-		fmt.Println("Failed to create node:", err)
+		fmt.Printf("Failed to create node: %v\n", err)
 		return
 	}
 
-	// Start the node
-	go node.Start()
-
-	// If it's a bootstrap node, display its public IP address and port
-	if *isBootstrap {
-		publicIP := getPublicIP()
-		fmt.Printf("Bootstrap node is running on: %s:8080\n", publicIP)
+	// Run the node
+	err = node.Run()
+	if err != nil {
+		fmt.Printf("Failed to start node: %v\n", err)
+		return
 	}
 
-	// Send periodic messages if not a bootstrap node
-	if !*isBootstrap {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+	// Set up message input in a goroutine
+	go handleUserInput(node)
 
-		for {
-			select {
-			case <-ticker.C:
-				message := "Hello, how are you?"
-				node.BroadcastMessage(message)
-				fmt.Println("Sent message to peers:", message)
-			}
+	// Set up graceful shutdown
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for termination signal
+	<-signalChan
+	fmt.Println("\nShutting down...")
+
+	// Stop the node
+	node.Stop()
+}
+
+// handleUserInput reads messages from the console and broadcasts them
+func handleUserInput(node *network.Node) {
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Type messages to broadcast (Ctrl+C to exit):")
+
+	for scanner.Scan() {
+		message := scanner.Text()
+		if message != "" {
+			node.BroadcastMessage(message)
+			fmt.Println("Message sent!")
 		}
 	}
 
-	// Keep the program running
-	select {}
-}
-
-func getPublicIP() string {
-	resp, err := http.Get("https://api.ipify.org?format=text")
-	if err != nil {
-		fmt.Println("Failed to get public IP:", err)
-		return "Unknown"
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("Error reading from console: %v\n", err)
 	}
-	defer resp.Body.Close()
-
-	ip, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Failed to read response body:", err)
-		return "Unknown"
-	}
-
-	return string(ip)
 }

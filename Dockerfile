@@ -1,4 +1,4 @@
-# Use the official Go IMAGE
+# Use the official Go image
 FROM golang:1.23
 
 # Set the working directory inside the container
@@ -16,7 +16,7 @@ COPY . .
 # Build the application
 RUN go build -o subworld-network main.go
 
-# Expose the port (optional, if your app uses networking)
+# Expose the port
 EXPOSE 8080
 
 # Command to run the executable
