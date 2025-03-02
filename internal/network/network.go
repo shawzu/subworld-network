@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,10 @@ const (
 	CmdStoreContent       = "STORE_CONTENT"
 	CmdFindContent        = "FIND_CONTENT"
 	CmdContentFound       = "CONTENT_FOUND"
+	CmdFindUserInfo       = "FIND_USER_INFO"
+	CmdUserInfoResult     = "USER_INFO_RESULT"
+	CmdFindPhoto          = "FIND_PHOTO"
+	CmdPhotoResult        = "PHOTO_RESULT"
 )
 
 // NodeConfig contains the configuration for a node
@@ -480,6 +485,14 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleFindContent(conn, msg)
 		case CmdContentFound:
 			n.handleContentFound(msg)
+		case CmdFindUserInfo:
+			n.handleFindUserInfo(conn, msg)
+		case CmdUserInfoResult:
+			n.handleUserInfoResult(conn, msg)
+		case CmdFindPhoto:
+			n.handleFindPhoto(conn, msg)
+		case CmdPhotoResult:
+			n.handlePhotoResult(conn, msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
@@ -1043,89 +1056,25 @@ func (n *Node) printConnectedPeers() {
 	}
 }
 
-// FindUser looks up a user by username in the DHT
 func (n *Node) FindUser(username string) (string, bool) {
-	// Create a key for the user
-	userKey := fmt.Sprintf("user:%s", username)
+	// Create a storage manager
+	storageManager := NewDHTStorageManager(n, n.storage)
 
-	// Look up in DHT
-	userInfo, found := n.dht.GetValue(userKey)
-	if found {
-		return userInfo, true
-	}
-
-	// Not found in local DHT, try to find through the network
-	userID := dht.NodeID(HashString(userKey)) // Using HashString instead of dht.HashString
-	closestNodes := n.dht.FindClosestNodes(userID, 20)
-
-	// Create find content request
-	findReq := Message{
-		Type:    CmdFindContent,
-		Sender:  n.address,
-		Content: fmt.Sprintf("%s:%s", "user", username),
-	}
-
-	// Try each node
-	for _, node := range closestNodes {
-		// Skip if it's ourselves - we already checked
-		if node.ID.Equal(n.dht.LocalID) {
-			continue
-		}
-
-		// Try to send the request
-		err := n.sendMessageToPeer(node.Address, findReq)
-		if err != nil {
-			continue
-		}
-
-	}
-
-	return "", false
+	// Use the enhanced distributed lookup
+	return storageManager.FindUser(username)
 }
 
 // RegisterUser registers a username in the DHT
 func (n *Node) RegisterUser(username string) error {
-	// Create a key for the user
-	userKey := fmt.Sprintf("user:%s", username)
-
-	// Check if the username is already taken
-	_, found := n.dht.GetValue(userKey)
-	if found {
-		return fmt.Errorf("username %s is already taken", username)
-	}
-
 	// Create user info with our address
 	userInfo := fmt.Sprintf("{\"username\":\"%s\",\"address\":\"%s\",\"public_key\":\"\"}",
 		username, n.address)
 
-	// Store in DHT
-	n.dht.StoreValue(userKey, userInfo)
+	// Create a storage manager
+	storageManager := NewDHTStorageManager(n, n.storage)
 
-	// Also store in the distributed network
-	// Find nodes close to this key
-	userID := dht.NodeID(HashString(userKey))
-	closestNodes := n.dht.FindClosestNodes(userID, 20)
-
-	// Create store content message
-	storeMsg := Message{
-		Type:   CmdStoreContent,
-		Sender: n.address,
-		Content: fmt.Sprintf("{\"id\":\"%s\",\"type\":\"user_info\",\"content\":\"%s\"}",
-			username, userInfo),
-	}
-
-	// Send to closest nodes
-	for _, node := range closestNodes {
-		// Skip if it's ourselves - we already stored it
-		if node.ID.Equal(n.dht.LocalID) {
-			continue
-		}
-
-		// Try to send
-		n.sendMessageToPeer(node.Address, storeMsg)
-	}
-
-	return nil
+	// Register using the distributed approach
+	return storageManager.RegisterUser(username, userInfo)
 }
 
 // GetUserMessages retrieves messages for a user
@@ -1405,4 +1354,114 @@ func (n *Node) GetPendingCallSignals(userID string) ([]*storage.EncryptedContent
 	}
 
 	return n.storage.GetContentByType(userID, storage.TypeCallSignal)
+}
+
+// handleFindUserInfo handles requests to find user information
+func (n *Node) handleFindUserInfo(conn net.Conn, msg Message) {
+	username := msg.Content
+	userKey := fmt.Sprintf("user:%s", username)
+
+	// Look up in local DHT
+	userInfo, found := n.dht.GetValue(userKey)
+	if !found {
+		// Not found
+		return
+	}
+
+	// Send result back
+	response := Message{
+		Type:    CmdUserInfoResult,
+		Sender:  n.address,
+		Content: fmt.Sprintf("{\"username\":\"%s\",\"info\":\"%s\"}", username, userInfo),
+	}
+
+	responseData, _ := json.Marshal(response)
+	conn.Write(responseData)
+}
+
+// handleUserInfoResult handles user info lookup results
+func (n *Node) handleUserInfoResult(conn net.Conn, msg Message) {
+	// Parse result
+	var result struct {
+		Username string `json:"username"`
+		Info     string `json:"info"`
+	}
+
+	if err := json.Unmarshal([]byte(msg.Content), &result); err != nil {
+		fmt.Printf("Invalid user info result: %v\n", err)
+		return
+	}
+
+	// Store in local DHT
+	userKey := fmt.Sprintf("user:%s", result.Username)
+	n.dht.StoreValue(userKey, result.Info)
+
+	fmt.Printf("Received user info for %s from %s\n", result.Username, msg.Sender)
+
+	// In a full implementation, you would notify waiting requests
+}
+
+// handleFindPhoto handles requests to find a photo
+func (n *Node) handleFindPhoto(conn net.Conn, msg Message) {
+	// Parse parameters
+	parts := strings.Split(msg.Content, ":")
+	if len(parts) != 3 {
+		return
+	}
+
+	userID := parts[0]
+	photoID := parts[1]
+	chunkIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+
+	// Look up in local storage
+	if n.storage == nil {
+		return
+	}
+
+	photos, err := n.storage.GetContentByType(userID, storage.TypePhoto)
+	if err != nil {
+		return
+	}
+
+	// Find matching photo
+	for _, photo := range photos {
+		if photo.ID == photoID && photo.ChunkIndex == chunkIndex {
+			// Found it, send back
+			photoData, err := json.Marshal(photo)
+			if err != nil {
+				return
+			}
+
+			response := Message{
+				Type:    CmdPhotoResult,
+				Sender:  n.address,
+				Content: string(photoData),
+			}
+
+			responseData, _ := json.Marshal(response)
+			conn.Write(responseData)
+			return
+		}
+	}
+}
+
+// handlePhotoResult handles photo lookup results
+func (n *Node) handlePhotoResult(conn net.Conn, msg Message) {
+	// Parse result
+	var photo storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &photo); err != nil {
+		fmt.Printf("Invalid photo result: %v\n", err)
+		return
+	}
+
+	// Store locally
+	if n.storage != nil {
+		n.storage.StoreContent(&photo)
+		fmt.Printf("Received photo %s chunk %d for user %s from %s\n",
+			photo.ID, photo.ChunkIndex, photo.RecipientID, msg.Sender)
+	}
+
 }

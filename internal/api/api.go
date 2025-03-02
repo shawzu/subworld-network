@@ -431,7 +431,11 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 			ChunkIndex:    -1, // Special value for metadata
 		}
 
-		if err := api.storage.StoreContent(metaContent); err != nil {
+		// Create storage manager
+		storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+		// Store metadata with distribution
+		if err := storageManager.StorePhoto(metaContent); err != nil {
 			http.Error(w, "Failed to store photo metadata: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -449,8 +453,11 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 		TotalChunks:   totalChunks,
 	}
 
-	// Store the photo chunk
-	if err := api.storage.StoreContent(content); err != nil {
+	// Create storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Store the photo chunk with distributed replication
+	if err := storageManager.StorePhoto(content); err != nil {
 		http.Error(w, "Failed to store photo: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -482,12 +489,8 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get photo content
-	photos, err := api.storage.GetContentByType(userID, storage.TypePhoto)
-	if err != nil {
-		http.Error(w, "Failed to get photos: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
+	// Create storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
 
 	// If chunk is specified, get just that chunk
 	if chunkStr != "" {
@@ -497,27 +500,28 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Find the requested chunk
-		var chunkContent *storage.EncryptedContent
-		for _, photo := range photos {
-			if photo.ID == photoID && photo.ChunkIndex == chunkIndex {
-				chunkContent = photo
-				break
-			}
-		}
-
-		if chunkContent == nil {
+		// Try to fetch the photo from the network
+		photo, err := storageManager.FetchPhoto(userID, photoID, chunkIndex)
+		if err != nil {
 			http.Error(w, "Chunk not found", http.StatusNotFound)
 			return
 		}
 
 		// Return the chunk
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write([]byte(chunkContent.EncryptedData))
+		w.Write([]byte(photo.EncryptedData))
 		return
 	}
 
 	// If no chunk specified, return metadata
+	// Get photo content - try local first
+	photos, err := api.storage.GetContentByType(userID, storage.TypePhoto)
+	if err != nil {
+		http.Error(w, "Failed to get photos: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Find the requested photo metadata
 	var photoMeta *storage.EncryptedContent
 	for _, photo := range photos {
 		if photo.ID == photoID && photo.ChunkIndex == -1 {
@@ -544,8 +548,13 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if photoMeta == nil {
-			http.Error(w, "Photo not found", http.StatusNotFound)
-			return
+			// Try to fetch from network
+			photo, err := storageManager.FetchPhoto(userID, photoID, -1)
+			if err != nil {
+				http.Error(w, "Photo not found", http.StatusNotFound)
+				return
+			}
+			photoMeta = photo
 		}
 	}
 
@@ -641,7 +650,7 @@ func (api *NodeAPI) handleFindUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Look up user
+	// Look up user with network-wide search
 	userInfo, found := api.node.FindUser(username)
 	if !found {
 		http.Error(w, "User not found", http.StatusNotFound)
@@ -676,7 +685,7 @@ func (api *NodeAPI) handleRegisterUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register user
+	// Register user with enhanced distribution
 	err := api.node.RegisterUser(request.Username)
 	if err != nil {
 		http.Error(w, "Failed to register user: "+err.Error(), http.StatusInternalServerError)

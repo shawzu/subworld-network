@@ -213,3 +213,231 @@ func (m *DHTStorageManager) FetchAllUserContent(userID string) []*storage.Encryp
 
 	return updatedContent
 }
+
+func (m *DHTStorageManager) RegisterUser(username, userInfo string) error {
+	// Create key for the user
+	userKey := fmt.Sprintf("user:%s", username)
+
+	// Store locally in DHT
+	m.node.dht.StoreValue(userKey, userInfo)
+
+	// Find nodes that should store this user info
+	userID := dht.NodeID(HashString(userKey))
+	targetNodes := m.node.dht.FindClosestNodes(userID, ReplicationFactor)
+
+	// Create store message
+	storeMsg := Message{
+		Type:   CmdStoreContent,
+		Sender: m.node.address,
+		Content: fmt.Sprintf("{\"key\":\"%s\",\"value\":\"%s\",\"type\":\"user_info\"}",
+			userKey, userInfo),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Distribute to target nodes
+	for _, node := range targetNodes {
+		// Skip ourselves
+		if node.ID.Equal(m.node.dht.LocalID) {
+			continue
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.Write(msgData)
+		} else {
+			// Try to establish connection
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.Write(msgData)
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FindUser looks up a user across the network
+func (m *DHTStorageManager) FindUser(username string) (string, bool) {
+	// Try local DHT first
+	userKey := fmt.Sprintf("user:%s", username)
+	userInfo, found := m.node.dht.GetValue(userKey)
+	if found {
+		return userInfo, true
+	}
+
+	// Not found locally, search the network
+	userID := dht.NodeID(HashString(userKey))
+	closestNodes := m.node.dht.FindClosestNodes(userID, ReplicationFactor*2)
+
+	// Create channel for results
+	resultChan := make(chan string, 1)
+
+	// Create find request
+	findReq := Message{
+		Type:    CmdFindUserInfo,
+		Sender:  m.node.address,
+		Content: username,
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Track queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Query each node
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		go func(nodeAddr string) {
+			// Try to get existing connection
+			if conn, ok := m.node.getPeerByAddress(nodeAddr); ok {
+				conn.Write(reqData)
+			} else {
+				// Try to establish connection
+				if conn, err := net.Dial("tcp", nodeAddr); err == nil {
+					conn.Write(reqData)
+					m.node.peersMutex.Lock()
+					m.node.peers[nodeAddr] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}(node.Address)
+	}
+
+	// Wait for result or timeout
+	select {
+	case result := <-resultChan:
+		// Store locally for future queries
+		m.node.dht.StoreValue(userKey, result)
+		return result, true
+	case <-time.After(2 * time.Second):
+		return "", false
+	}
+}
+
+// StorePhoto stores a photo chunk and distributes it across the network
+func (m *DHTStorageManager) StorePhoto(photo *storage.EncryptedContent) error {
+	// Store locally first
+	if err := m.storage.StoreContent(photo); err != nil {
+		return err
+	}
+
+	// Determine which nodes should store this photo
+	photoKey := fmt.Sprintf("photo:%s:%s:%d", photo.RecipientID, photo.ID, photo.ChunkIndex)
+	photoHash := HashString(photoKey)
+	targetID := dht.NodeID(photoHash)
+
+	// Find closest nodes
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+	// Serialize the photo
+	photoData, err := json.Marshal(photo)
+	if err != nil {
+		return fmt.Errorf("failed to marshal photo: %w", err)
+	}
+
+	// Create store message
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  m.node.address,
+		Content: string(photoData),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Distribute to target nodes
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) {
+			continue // Skip ourselves
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.Write(msgData)
+		} else {
+			// Try to establish connection
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.Write(msgData)
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchPhoto tries to find a photo across the network
+func (m *DHTStorageManager) FetchPhoto(userID, photoID string, chunkIndex int) (*storage.EncryptedContent, error) {
+	// Try local storage first
+	photos, err := m.storage.GetContentByType(userID, storage.TypePhoto)
+	if err == nil {
+		for _, photo := range photos {
+			if photo.ID == photoID && photo.ChunkIndex == chunkIndex {
+				return photo, nil
+			}
+		}
+	}
+
+	// Not found locally, search the network
+	photoKey := fmt.Sprintf("photo:%s:%s:%d", userID, photoID, chunkIndex)
+	targetID := dht.NodeID(HashString(photoKey))
+
+	// Find nodes that might have this photo
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create find photo request
+	findReq := Message{
+		Type:    CmdFindPhoto,
+		Sender:  m.node.address,
+		Content: fmt.Sprintf("%s:%s:%d", userID, photoID, chunkIndex),
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Track queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Set up channel for results
+	resultChan := make(chan *storage.EncryptedContent, 1)
+
+	// Query each node
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		go func(nodeAddr string) {
+			if conn, ok := m.node.getPeerByAddress(nodeAddr); ok {
+				conn.Write(reqData)
+			} else {
+				if conn, err := net.Dial("tcp", nodeAddr); err == nil {
+					conn.Write(reqData)
+					m.node.peersMutex.Lock()
+					m.node.peers[nodeAddr] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}(node.Address)
+	}
+
+	// Wait for result or timeout
+	select {
+	case result := <-resultChan:
+		// Store locally for future queries
+		m.storage.StoreContent(result)
+		return result, nil
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("photo not found in network")
+	}
+}
