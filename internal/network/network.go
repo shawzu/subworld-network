@@ -1,14 +1,19 @@
 package network
 
 import (
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"subworld-network/internal/dht"
+	"subworld-network/internal/storage"
 )
 
 // Constants for node types and commands
@@ -20,12 +25,31 @@ const (
 	CmdRequestPeers = "REQUEST_PEERS"
 	CmdPeersList    = "PEERS_LIST"
 	CmdHandshake    = "HANDSHAKE"
+	CmdMessage      = "MESSAGE"
+	CmdStoreContent = "STORE_CONTENT"
+	CmdFindContent  = "FIND_CONTENT"
+	CmdContentFound = "CONTENT_FOUND"
 )
 
 // NodeConfig contains the configuration for a node
 type NodeConfig struct {
 	BootstrapNodes []string // List of bootstrap node IPs
 	ForceBootstrap bool     // Force this node to be a bootstrap node
+	ListenPort     int      // Port to listen on (default: 8080)
+	MaxPeers       int      // Maximum number of peers (default: 100)
+}
+
+type NodeInfoMessage struct {
+	ID        string `json:"id"`
+	Address   string `json:"address"`
+	PublicKey string `json:"public_key,omitempty"`
+}
+
+// Message represents a structured message between nodes
+type Message struct {
+	Type    string `json:"type"`
+	Sender  string `json:"sender"`
+	Content string `json:"content"`
 }
 
 // Node represents a network node
@@ -37,10 +61,34 @@ type Node struct {
 	peersMutex     sync.RWMutex
 	listener       net.Listener
 	isRunning      bool
+	dht            *dht.DHT             // DHT integration
+	storage        *storage.NodeStorage // Local storage
+	maxPeers       int                  // Maximum number of peers
+}
+
+func (n *Node) getPeerByAddress(address string) (net.Conn, bool) {
+	n.peersMutex.RLock()
+	defer n.peersMutex.RUnlock()
+
+	conn, exists := n.peers[address]
+	return conn, exists
+}
+
+// HashString creates a SHA1 hash from a string
+func HashString(s string) [20]byte {
+	return sha1.Sum([]byte(s))
 }
 
 // NewNode creates a new node
 func NewNode(config NodeConfig) (*Node, error) {
+	// Set default values if not provided
+	if config.ListenPort == 0 {
+		config.ListenPort = 8080
+	}
+	if config.MaxPeers == 0 {
+		config.MaxPeers = 100
+	}
+
 	// Get public IP
 	publicIP, err := getPublicIP()
 	if err != nil {
@@ -54,7 +102,7 @@ func NewNode(config NodeConfig) (*Node, error) {
 	}
 
 	fmt.Printf("Using IP: %s\n", publicIP)
-	address := fmt.Sprintf("%s:8080", publicIP)
+	address := fmt.Sprintf("%s:%d", publicIP, config.ListenPort)
 
 	// Determine node type based on IP or forced mode
 	nodeType := RegularNode
@@ -64,7 +112,8 @@ func NewNode(config NodeConfig) (*Node, error) {
 		fmt.Println("IMPORTANT: Running in FORCED BOOTSTRAP MODE")
 	} else {
 		// Check if our IP is in the bootstrap list
-		for _, bootstrapIP := range config.BootstrapNodes {
+		for _, bootstrapAddr := range config.BootstrapNodes {
+			bootstrapIP := strings.Split(bootstrapAddr, ":")[0]
 			if publicIP == bootstrapIP {
 				nodeType = BootstrapNode
 				fmt.Printf("IP %s matches bootstrap node list, running as BOOTSTRAP node\n", publicIP)
@@ -78,10 +127,90 @@ func NewNode(config NodeConfig) (*Node, error) {
 		address:        address,
 		bootstrapNodes: config.BootstrapNodes,
 		peers:          make(map[string]net.Conn),
+		maxPeers:       config.MaxPeers,
 	}
 
 	fmt.Printf("Node created: Type=%s, Address=%s\n", node.nodeType, node.address)
 	return node, nil
+}
+
+// SetStorage sets the storage backend
+func (n *Node) SetStorage(storage *storage.NodeStorage) {
+	n.storage = storage
+}
+
+// GetNodeType returns the node type
+func (n *Node) GetNodeType() string {
+	return n.nodeType
+}
+
+// GetAddress returns the node address
+func (n *Node) GetAddress() string {
+	return n.address
+}
+
+// GetDHT returns the DHT instance
+func (n *Node) GetDHT() *dht.DHT {
+	return n.dht
+}
+
+// Run starts the node operation
+func (n *Node) Run() error {
+	if n.isRunning {
+		return fmt.Errorf("node is already running")
+	}
+
+	// Initialize DHT
+	n.initializeDHT()
+
+	// Start TCP listener for all nodes
+	port := strings.Split(n.address, ":")[1]
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	if err != nil {
+		return fmt.Errorf("failed to start listener: %w", err)
+	}
+	n.listener = listener
+	n.isRunning = true
+
+	fmt.Printf("Node started as %s on %s\n", n.nodeType, n.address)
+
+	// Accept connections in a goroutine
+	go n.acceptConnections()
+
+	// If this is a regular node, connect to bootstrap nodes
+	if n.nodeType == RegularNode {
+		go n.connectToBootstrapNodes()
+	} else {
+		fmt.Println("Running as bootstrap node - waiting for connections")
+	}
+
+	// Start heartbeat to maintain peer list
+	go n.startHeartbeat()
+
+	return nil
+}
+
+// Stop gracefully shuts down the node
+func (n *Node) Stop() {
+	if !n.isRunning {
+		return
+	}
+
+	// Close listener
+	if n.listener != nil {
+		n.listener.Close()
+	}
+
+	// Close all peer connections
+	n.peersMutex.Lock()
+	for addr, conn := range n.peers {
+		conn.Close()
+		delete(n.peers, addr)
+	}
+	n.peersMutex.Unlock()
+
+	n.isRunning = false
+	fmt.Println("Node stopped")
 }
 
 // GetPublicIP attempts to get the public IP address by checking various services
@@ -141,66 +270,94 @@ func getLocalIP() (string, error) {
 	return "", fmt.Errorf("no non-loopback IPv4 address found")
 }
 
-// Run starts the node operation
-func (n *Node) Run() error {
-	if n.isRunning {
-		return fmt.Errorf("node is already running")
-	}
+// Initialize DHT for a node
+func (n *Node) initializeDHT() {
+	fmt.Println("Initializing DHT...")
+	n.dht = dht.NewDHT(n.address)
 
-	// Start TCP listener for all nodes
-	listener, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		return fmt.Errorf("failed to start listener: %w", err)
-	}
-	n.listener = listener
-	n.isRunning = true
-
-	fmt.Printf("Node started as %s on %s\n", n.nodeType, n.address)
-
-	// Accept connections in a goroutine
-	go n.acceptConnections()
-
-	// If this is a regular node, connect to bootstrap nodes
-	if n.nodeType == RegularNode {
-		go n.connectToBootstrapNodes()
-	} else {
-		fmt.Println("Running as bootstrap node - waiting for connections")
-	}
-
-	// Start heartbeat to maintain peer list
-	go n.startHeartbeat()
-
-	return nil
+	// Start periodic DHT maintenance
+	go n.dhtMaintenance()
 }
 
-// Stop gracefully shuts down the node
-func (n *Node) Stop() {
-	if !n.isRunning {
+// dhtMaintenance performs periodic DHT-related tasks
+func (n *Node) dhtMaintenance() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for n.isRunning {
+		select {
+		case <-ticker.C:
+			// Refresh buckets that haven't been refreshed recently
+			n.dht.RefreshAllBuckets()
+
+			// Republish our own info
+			n.publishNodeToDHT()
+
+			// Check for messages addressed to us
+			n.checkDHTMessages()
+		}
+	}
+}
+
+// publishNodeToDHT publishes this node's information to the DHT
+func (n *Node) publishNodeToDHT() {
+	// Store our node info under a well-known key format
+	key := fmt.Sprintf("node:%s", n.dht.LocalID.String())
+
+	// Create node info JSON
+	nodeInfo := NodeInfoMessage{
+		ID:        n.dht.LocalID.String(),
+		Address:   n.address,
+		PublicKey: "", // Add your public key here if using encryption
+	}
+
+	nodeInfoJSON, err := json.Marshal(nodeInfo)
+	if err != nil {
+		fmt.Printf("Failed to marshal node info: %v\n", err)
 		return
 	}
 
-	// Close listener
-	if n.listener != nil {
-		n.listener.Close()
-	}
+	// Store locally
+	n.dht.StoreValue(key, string(nodeInfoJSON))
 
-	// Close all peer connections
-	n.peersMutex.Lock()
-	for addr, conn := range n.peers {
-		conn.Close()
-		delete(n.peers, addr)
-	}
-	n.peersMutex.Unlock()
+	// Broadcast to closest nodes
+	closestNodes := n.dht.FindClosestNodes(n.dht.LocalID, dht.K)
 
-	n.isRunning = false
-	fmt.Println("Node stopped")
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  n.address,
+		Content: string(nodeInfoJSON),
+	}
+	storeData, _ := json.Marshal(storeMsg)
+
+	for _, node := range closestNodes {
+		if peer, ok := n.getPeerByAddress(node.Address); ok {
+			peer.Write(storeData)
+		}
+	}
 }
 
-// connectToBootstrapNodes attempts to connect to all bootstrap nodes
+// checkDHTMessages checks for messages addressed to this node in the DHT
+func (n *Node) checkDHTMessages() {
+	// Check for messages addressed to us
+	messageKey := fmt.Sprintf("msgs:%s", n.dht.LocalID.String())
+
+	// In a real implementation, you'd do a DHT lookup for this key
+	// For now, we'll just check our local store
+	if messages, found := n.dht.GetValue(messageKey); found {
+		fmt.Printf("Found messages for us: %s\n", messages)
+		// Process the messages...
+
+		// Clear the messages
+		n.dht.StoreValue(messageKey, "")
+	}
+}
+
+// connectToBootstrapNodes attempts to connect to bootstrap nodes
 func (n *Node) connectToBootstrapNodes() {
 	for _, bootstrapAddr := range n.bootstrapNodes {
 		// Skip if this is our own address
-		if strings.HasPrefix(bootstrapAddr, n.address) {
+		if strings.HasPrefix(bootstrapAddr, strings.Split(n.address, ":")[0]) {
 			continue
 		}
 
@@ -210,6 +367,7 @@ func (n *Node) connectToBootstrapNodes() {
 		}
 
 		// Try to connect
+		fmt.Printf("Attempting to connect to bootstrap node: %s\n", bootstrapAddr)
 		conn, err := net.Dial("tcp", bootstrapAddr)
 		if err != nil {
 			fmt.Printf("Failed to connect to bootstrap node %s: %v\n", bootstrapAddr, err)
@@ -240,7 +398,8 @@ func (n *Node) connectToBootstrapNodes() {
 		// Handle messages from this peer
 		go n.handlePeer(conn)
 
-		// We only need to connect to one bootstrap node
+		// We only need to connect to one bootstrap node initially
+		// The DHT will help us find more peers
 		break
 	}
 }
@@ -257,16 +416,20 @@ func (n *Node) acceptConnections() {
 			continue
 		}
 
+		// Check if we've reached max peers
+		n.peersMutex.RLock()
+		peerCount := len(n.peers)
+		n.peersMutex.RUnlock()
+
+		if peerCount >= n.maxPeers && n.nodeType != BootstrapNode {
+			fmt.Printf("Rejected connection: max peers (%d) reached\n", n.maxPeers)
+			conn.Close()
+			continue
+		}
+
 		// Handle the connection in a new goroutine
 		go n.handlePeer(conn)
 	}
-}
-
-// Message represents a structured message between nodes
-type Message struct {
-	Type    string `json:"type"`
-	Sender  string `json:"sender"`
-	Content string `json:"content"`
 }
 
 // handlePeer handles communication with a peer
@@ -304,10 +467,18 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handlePeersList(msg)
 		case CmdHandshake:
 			n.handleHandshake(conn, msg)
-		default:
+		case CmdMessage:
 			// Regular message, broadcast to other peers
 			fmt.Printf("Message from %s: %s\n", msg.Sender, msg.Content)
 			n.broadcastMessage(msg)
+		case CmdStoreContent:
+			n.handleStoreContent(conn, msg)
+		case CmdFindContent:
+			n.handleFindContent(conn, msg)
+		case CmdContentFound:
+			n.handleContentFound(msg)
+		default:
+			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
 	}
 }
@@ -332,6 +503,11 @@ func (n *Node) handleJoinNetwork(conn net.Conn, msg Message) {
 
 	// Send the peer list to the new node
 	n.sendPeerList(conn)
+
+	// Add the new node to our DHT routing table
+	// Extract the node ID from the sender address
+	nodeID := sha1.Sum([]byte(msg.Sender))
+	n.dht.AddNode(nodeID, msg.Sender, "")
 
 	// Broadcast to other peers that a new node joined
 	n.broadcastPeerList()
@@ -358,6 +534,21 @@ func (n *Node) handlePeersList(msg Message) {
 			continue
 		}
 
+		// Add to DHT routing table
+		nodeID := sha1.Sum([]byte(peerAddr))
+		n.dht.AddNode(nodeID, peerAddr, "")
+
+		// Check if we've reached max peers before connecting to more
+		n.peersMutex.RLock()
+		peerCount := len(n.peers)
+		n.peersMutex.RUnlock()
+
+		if peerCount >= n.maxPeers && n.nodeType != BootstrapNode {
+			fmt.Printf("Not connecting to new peer %s: max peers (%d) reached\n",
+				peerAddr, n.maxPeers)
+			continue
+		}
+
 		// Try to connect to the new peer
 		go n.connectToPeer(peerAddr)
 	}
@@ -370,21 +561,143 @@ func (n *Node) handleHandshake(conn net.Conn, msg Message) {
 	n.peers[msg.Sender] = conn
 	n.peersMutex.Unlock()
 
+	// Also add to DHT routing table
+	nodeID := sha1.Sum([]byte(msg.Sender))
+	n.dht.AddNode(nodeID, msg.Sender, "")
+
 	fmt.Printf("Handshake completed with %s\n", msg.Sender)
+}
+
+// handleStoreContent handles a request to store content
+func (n *Node) handleStoreContent(conn net.Conn, msg Message) {
+	// If we have storage configured, store the content
+	if n.storage != nil {
+		var content storage.EncryptedContent
+		if err := json.Unmarshal([]byte(msg.Content), &content); err != nil {
+			fmt.Printf("Invalid content in STORE_CONTENT message: %v\n", err)
+			return
+		}
+
+		// Store the content
+		err := n.storage.StoreContent(&content)
+		if err != nil {
+			fmt.Printf("Failed to store content: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Stored content ID %s for user %s\n", content.ID, content.RecipientID)
+	} else {
+		// If no storage configured, just keep in DHT
+		// This is a simplified approach - in a real system you'd parse the content
+		// and store with appropriate keys
+		contentID := fmt.Sprintf("content:%s", time.Now().Format(time.RFC3339Nano))
+		n.dht.StoreValue(contentID, msg.Content)
+	}
+}
+
+// handleFindContent handles a request to find content
+func (n *Node) handleFindContent(conn net.Conn, msg Message) {
+	// Parse the content ID from the message
+	parts := strings.Split(msg.Content, ":")
+	if len(parts) != 2 {
+		fmt.Printf("Invalid FIND_CONTENT message format: %s\n", msg.Content)
+		return
+	}
+
+	userID := parts[0]
+	contentID := parts[1]
+
+	// Check if we have the content
+	var foundContent *storage.EncryptedContent
+	var found bool
+
+	if n.storage != nil {
+		// Look in our local storage
+		messages, err := n.storage.GetMessagesByUser(userID, false)
+		if err == nil {
+			for _, content := range messages {
+				if content.ID == contentID {
+					foundContent = content
+					found = true
+					break
+				}
+			}
+		}
+	}
+
+	// If found, send it back
+	if found && foundContent != nil {
+		contentData, err := json.Marshal(foundContent)
+		if err != nil {
+			fmt.Printf("Failed to marshal content: %v\n", err)
+			return
+		}
+
+		response := Message{
+			Type:    CmdContentFound,
+			Sender:  n.address,
+			Content: string(contentData),
+		}
+
+		responseData, _ := json.Marshal(response)
+		conn.Write(responseData)
+	} else {
+		// Not found, could forward the request to other nodes
+		fmt.Printf("Content %s for user %s not found locally\n", contentID, userID)
+	}
+}
+
+// handleContentFound processes a response with found content
+func (n *Node) handleContentFound(msg Message) {
+	// Parse the content
+	var content storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &content); err != nil {
+		fmt.Printf("Invalid content in CONTENT_FOUND message: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Received content %s for user %s from %s\n",
+		content.ID, content.RecipientID, msg.Sender)
+
+	// Store locally if we have storage
+	if n.storage != nil {
+		n.storage.StoreContent(&content)
+	}
+
+	// Additional processing could be done here, like notifying waiting requests
 }
 
 // sendPeerList sends our list of peers to the specified connection
 func (n *Node) sendPeerList(conn net.Conn) {
-	// Get the current peer list
+	// Get the current peer list from both direct connections and DHT
 	var peerList []string
+
+	// Add directly connected peers
 	n.peersMutex.RLock()
 	for peer := range n.peers {
 		peerList = append(peerList, peer)
 	}
 	n.peersMutex.RUnlock()
 
-	// Add ourselves to the list
+	// Add ourselves
 	peerList = append(peerList, n.address)
+
+	// Add peers from DHT routing table
+	dhtPeers := n.dht.GetAllPeers()
+	for _, peer := range dhtPeers {
+		// Check if already in the list
+		exists := false
+		for _, existingPeer := range peerList {
+			if existingPeer == peer.Address {
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			peerList = append(peerList, peer.Address)
+		}
+	}
 
 	// Serialize the peer list
 	peerListData, err := json.Marshal(peerList)
@@ -407,12 +720,36 @@ func (n *Node) sendPeerList(conn net.Conn) {
 func (n *Node) broadcastPeerList() {
 	// Get the current peer list
 	var peerList []string
+
+	// Add directly connected peers
 	n.peersMutex.RLock()
 	for peer := range n.peers {
 		peerList = append(peerList, peer)
 	}
 	peerList = append(peerList, n.address)
 	n.peersMutex.RUnlock()
+
+	// Add peers from DHT routing table
+	dhtPeers := n.dht.GetAllPeers()
+	for _, peer := range dhtPeers {
+		// Check if already in the list
+		exists := false
+		for _, existingPeer := range peerList {
+			if existingPeer == peer.Address {
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			peerList = append(peerList, peer.Address)
+		}
+	}
+
+	// Limit peer list size to avoid massive messages
+	if len(peerList) > 100 {
+		peerList = peerList[:100]
+	}
 
 	// Serialize the peer list
 	peerListData, err := json.Marshal(peerList)
@@ -473,6 +810,10 @@ func (n *Node) connectToPeer(peerAddr string) {
 	n.peers[peerAddr] = conn
 	n.peersMutex.Unlock()
 
+	// Add to DHT routing table
+	nodeID := sha1.Sum([]byte(peerAddr))
+	n.dht.AddNode(nodeID, peerAddr, "")
+
 	fmt.Printf("Connected to peer: %s\n", peerAddr)
 
 	// Handle messages from this peer
@@ -482,11 +823,12 @@ func (n *Node) connectToPeer(peerAddr string) {
 // BroadcastMessage broadcasts a text message to all peers
 func (n *Node) BroadcastMessage(text string) {
 	msg := Message{
-		Type:    "MESSAGE",
+		Type:    CmdMessage,
 		Sender:  n.address,
 		Content: text,
 	}
 	n.broadcastMessage(msg)
+
 }
 
 // broadcastMessage sends a message to all connected peers except the sender
@@ -510,6 +852,45 @@ func (n *Node) broadcastMessage(msg Message) {
 	}
 }
 
+// sendMessageToPeer sends a message to a specific peer
+func (n *Node) sendMessageToPeer(peerAddr string, msg Message) error {
+	// Check if we're already connected
+	n.peersMutex.RLock()
+	conn, connected := n.peers[peerAddr]
+	n.peersMutex.RUnlock()
+
+	if !connected {
+		// Try to connect
+		newConn, err := net.Dial("tcp", peerAddr)
+		if err != nil {
+			return fmt.Errorf("failed to connect to peer %s: %w", peerAddr, err)
+		}
+
+		// Add to peers
+		n.peersMutex.Lock()
+		n.peers[peerAddr] = newConn
+		n.peersMutex.Unlock()
+
+		// Start handling messages
+		go n.handlePeer(newConn)
+
+		conn = newConn
+	}
+
+	// Serialize and send message
+	msgData, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+
+	_, err = conn.Write(msgData)
+	if err != nil {
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+
+	return nil
+}
+
 // startHeartbeat periodically sends peer list updates and removes dead connections
 func (n *Node) startHeartbeat() {
 	ticker := time.NewTicker(30 * time.Second)
@@ -521,7 +902,7 @@ func (n *Node) startHeartbeat() {
 			// Print connected peers
 			n.printConnectedPeers()
 
-			// Request peers list from bootstrap nodes if we're a regular node
+			// Request peers list from bootstrap nodes if we're a regular node with no peers
 			if n.nodeType == RegularNode && len(n.peers) == 0 {
 				n.connectToBootstrapNodes()
 			}
@@ -530,17 +911,413 @@ func (n *Node) startHeartbeat() {
 			if n.nodeType == BootstrapNode {
 				n.broadcastPeerList()
 			}
+
+			// Refresh DHT buckets
+			n.RefreshDHT()
 		}
 	}
 }
 
+// RefreshDHT refreshes the DHT buckets
+func (n *Node) RefreshDHT() {
+	n.dht.RefreshAllBuckets()
+}
+
 // printConnectedPeers displays all connected peers
 func (n *Node) printConnectedPeers() {
+	// Get directly connected peers
 	n.peersMutex.RLock()
-	defer n.peersMutex.RUnlock()
-
-	fmt.Printf("Connected peers (%d):\n", len(n.peers))
+	directPeers := make(map[string]bool)
 	for addr := range n.peers {
+		directPeers[addr] = true
+	}
+	directPeerCount := len(directPeers)
+	n.peersMutex.RUnlock()
+
+	// Get DHT peers
+	dhtPeers := n.dht.GetAllPeers()
+
+	fmt.Printf("Connected peers (%d direct, %d in DHT):\n", directPeerCount, len(dhtPeers))
+
+	// Print direct peers
+	fmt.Println("Direct connections:")
+	for addr := range directPeers {
 		fmt.Printf("  - %s\n", addr)
 	}
+
+	// Print DHT peers (limit to 10 for cleaner output)
+	fmt.Println("DHT routing table (sample):")
+	peerCount := 0
+	for _, peer := range dhtPeers {
+		if peerCount >= 10 {
+			fmt.Printf("  - ... and %d more\n", len(dhtPeers)-10)
+			break
+		}
+		fmt.Printf("  - %s (ID: %s)\n", peer.Address, peer.ID.String()[:8])
+		peerCount++
+	}
+}
+
+// FindUser looks up a user by username in the DHT
+func (n *Node) FindUser(username string) (string, bool) {
+	// Create a key for the user
+	userKey := fmt.Sprintf("user:%s", username)
+
+	// Look up in DHT
+	userInfo, found := n.dht.GetValue(userKey)
+	if found {
+		return userInfo, true
+	}
+
+	// Not found in local DHT, try to find through the network
+	userID := dht.NodeID(HashString(userKey)) // Using HashString instead of dht.HashString
+	closestNodes := n.dht.FindClosestNodes(userID, 20)
+
+	// Create find content request
+	findReq := Message{
+		Type:    CmdFindContent,
+		Sender:  n.address,
+		Content: fmt.Sprintf("%s:%s", "user", username),
+	}
+
+	// Try each node
+	for _, node := range closestNodes {
+		// Skip if it's ourselves - we already checked
+		if node.ID.Equal(n.dht.LocalID) {
+			continue
+		}
+
+		// Try to send the request
+		err := n.sendMessageToPeer(node.Address, findReq)
+		if err != nil {
+			continue
+		}
+
+	}
+
+	return "", false
+}
+
+// RegisterUser registers a username in the DHT
+func (n *Node) RegisterUser(username string) error {
+	// Create a key for the user
+	userKey := fmt.Sprintf("user:%s", username)
+
+	// Check if the username is already taken
+	_, found := n.dht.GetValue(userKey)
+	if found {
+		return fmt.Errorf("username %s is already taken", username)
+	}
+
+	// Create user info with our address
+	userInfo := fmt.Sprintf("{\"username\":\"%s\",\"address\":\"%s\",\"public_key\":\"\"}",
+		username, n.address)
+
+	// Store in DHT
+	n.dht.StoreValue(userKey, userInfo)
+
+	// Also store in the distributed network
+	// Find nodes close to this key
+	userID := dht.NodeID(HashString(userKey))
+	closestNodes := n.dht.FindClosestNodes(userID, 20)
+
+	// Create store content message
+	storeMsg := Message{
+		Type:   CmdStoreContent,
+		Sender: n.address,
+		Content: fmt.Sprintf("{\"id\":\"%s\",\"type\":\"user_info\",\"content\":\"%s\"}",
+			username, userInfo),
+	}
+
+	// Send to closest nodes
+	for _, node := range closestNodes {
+		// Skip if it's ourselves - we already stored it
+		if node.ID.Equal(n.dht.LocalID) {
+			continue
+		}
+
+		// Try to send
+		n.sendMessageToPeer(node.Address, storeMsg)
+	}
+
+	return nil
+}
+
+// GetUserMessages retrieves messages for a user
+func (n *Node) GetUserMessages(userID string) ([]*storage.EncryptedContent, error) {
+	if n.storage == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+
+	return n.storage.GetMessagesByUser(userID, false)
+}
+
+// GetContentByType retrieves content of a specific type for a user
+func (n *Node) GetContentByType(userID string, contentType storage.ContentType) ([]*storage.EncryptedContent, error) {
+	if n.storage == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+
+	return n.storage.GetContentByType(userID, contentType)
+}
+
+// SendMessageToUser sends a message to a specific user
+func (n *Node) SendMessageToUser(username, message string) error {
+	// Find user address
+	userInfo, found := n.FindUser(username)
+	if !found {
+		return fmt.Errorf("user %s not found", username)
+	}
+
+	// Parse user info
+	var userInfoMap map[string]string
+	err := json.Unmarshal([]byte(userInfo), &userInfoMap)
+	if err != nil {
+		return fmt.Errorf("invalid user info: %v", err)
+	}
+
+	address, ok := userInfoMap["address"]
+	if !ok {
+		return fmt.Errorf("user info doesn't contain address")
+	}
+
+	// Try to send directly if connected
+	n.peersMutex.RLock()
+	_, connected := n.peers[address]
+	n.peersMutex.RUnlock()
+
+	if connected {
+		// Send directly
+		msg := Message{
+			Type:    CmdMessage,
+			Sender:  n.address,
+			Content: message,
+		}
+		msgData, _ := json.Marshal(msg)
+
+		n.peersMutex.RLock()
+		conn := n.peers[address]
+		n.peersMutex.RUnlock()
+
+		_, err := conn.Write(msgData)
+		if err != nil {
+			// If direct send fails, store in DHT
+			return n.storeMessageInDHT(username, message)
+		}
+		return nil
+	}
+
+	// Not directly connected, store in DHT for later retrieval
+	return n.storeMessageInDHT(username, message)
+}
+
+// storeMessageInDHT stores a message in the DHT for later retrieval
+func (n *Node) storeMessageInDHT(username, message string) error {
+	timestamp := time.Now().Unix()
+	messageKey := fmt.Sprintf("msgs:%s:%d", username, timestamp)
+	messageData := fmt.Sprintf("{\"from\":\"%s\",\"content\":\"%s\",\"time\":%d}",
+		n.address, message, timestamp)
+
+	// Store in our local DHT
+	n.dht.StoreValue(messageKey, messageData)
+
+	// Also store in the distributed network
+	// Find nodes close to this key
+	msgID := dht.NodeID(HashString(messageKey))
+	closestNodes := n.dht.FindClosestNodes(msgID, 20)
+
+	// Create store content message
+	storeMsg := Message{
+		Type:   CmdStoreContent,
+		Sender: n.address,
+		Content: fmt.Sprintf("{\"id\":\"%s\",\"recipient\":\"%s\",\"content\":\"%s\"}",
+			messageKey, username, messageData),
+	}
+
+	// Send to closest nodes
+	for _, node := range closestNodes {
+		// Skip if it's ourselves - we already stored it
+		if node.ID.Equal(n.dht.LocalID) {
+			continue
+		}
+
+		// Try to send
+		n.sendMessageToPeer(node.Address, storeMsg)
+	}
+
+	return nil
+}
+
+// UploadPhoto uploads a photo to the DHT
+func (n *Node) UploadPhoto(recipientUsername string, photoData []byte, fileName string) (string, error) {
+	// Generate message ID
+	messageID := fmt.Sprintf("photo-%d", time.Now().UnixNano())
+
+	// Determine MIME type from data
+	mimeType := http.DetectContentType(photoData)
+	fmt.Printf("Uploading photo with MIME type: %s\n", mimeType)
+
+	// Split photo into chunks if large
+	chunkSize := 65536 // 64KB
+	chunkCount := (len(photoData) + chunkSize - 1) / chunkSize
+
+	// Find recipient's public key
+	userInfo, found := n.FindUser(recipientUsername)
+	if !found {
+		return "", fmt.Errorf("user %s not found", recipientUsername)
+	}
+
+	// Parse user info
+	var userInfoMap map[string]string
+	err := json.Unmarshal([]byte(userInfo), &userInfoMap)
+	if err != nil {
+		return "", fmt.Errorf("invalid user info: %v", err)
+	}
+
+	recipientID, ok := userInfoMap["public_key"]
+	if !ok || recipientID == "" {
+		recipientID = userInfoMap["address"] // Fallback to address
+	}
+
+	// Create metadata message
+	photoMsg := &storage.EncryptedContent{
+		ID:            messageID,
+		SenderID:      n.address,
+		RecipientID:   recipientID,
+		Type:          storage.TypePhoto,
+		EncryptedData: "", // Metadata only
+		Timestamp:     time.Now(),
+		TotalChunks:   chunkCount,
+		ChunkIndex:    -1, // Metadata indicator
+	}
+
+	// Store metadata
+	if n.storage != nil {
+		if err := n.storage.StoreContent(photoMsg); err != nil {
+			return "", fmt.Errorf("failed to store photo metadata: %w", err)
+		}
+	}
+
+	// Store chunks
+	for i := 0; i < chunkCount; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(photoData) {
+			end = len(photoData)
+		}
+
+		chunk := &storage.EncryptedContent{
+			ID:            messageID,
+			SenderID:      n.address,
+			RecipientID:   recipientID,
+			Type:          storage.TypePhoto,
+			EncryptedData: string(photoData[start:end]), // In reality, this would be encrypted
+			Timestamp:     time.Now(),
+			TotalChunks:   chunkCount,
+			ChunkIndex:    i,
+		}
+
+		// Store locally
+		if n.storage != nil {
+			if err := n.storage.StoreContent(chunk); err != nil {
+				return "", fmt.Errorf("failed to store photo chunk %d: %w", i, err)
+			}
+		}
+
+		// Also store in DHT (simplified)
+		chunkKey := fmt.Sprintf("photo:%s:%d", messageID, i)
+		chunkData, _ := json.Marshal(chunk)
+		n.dht.StoreValue(chunkKey, string(chunkData))
+	}
+
+	return messageID, nil
+}
+
+// GetPhoto retrieves a photo from storage
+func (n *Node) GetPhoto(userID, photoID string) (*storage.EncryptedContent, []*storage.EncryptedContent, error) {
+	if n.storage == nil {
+		return nil, nil, fmt.Errorf("no storage configured")
+	}
+
+	// Get all photo content for the user
+	photos, err := n.storage.GetContentByType(userID, storage.TypePhoto)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Find metadata and chunks
+	var metadata *storage.EncryptedContent
+	var chunks []*storage.EncryptedContent
+
+	for _, content := range photos {
+		if content.ID == photoID {
+			if content.ChunkIndex == -1 {
+				// This is the metadata
+				metadata = content
+			} else {
+				// This is a chunk
+				chunks = append(chunks, content)
+			}
+		}
+	}
+
+	// Sort chunks by index
+	if chunks != nil {
+		sort.Slice(chunks, func(i, j int) bool {
+			return chunks[i].ChunkIndex < chunks[j].ChunkIndex
+		})
+	}
+
+	if metadata == nil {
+		return nil, nil, fmt.Errorf("photo %s not found", photoID)
+	}
+
+	return metadata, chunks, nil
+}
+
+// HandleCallSignal processes a WebRTC call signaling message
+func (n *Node) HandleCallSignal(signal *storage.EncryptedContent) error {
+	// Store signal with short TTL
+	if n.storage != nil {
+		signal.TTL = 300 // 5 minute TTL
+		if err := n.storage.StoreContent(signal); err != nil {
+			return fmt.Errorf("failed to store signal: %w", err)
+		}
+	}
+
+	// Try to forward directly if recipient is connected
+	n.peersMutex.RLock()
+	conn, connected := n.peers[signal.RecipientID]
+	n.peersMutex.RUnlock()
+
+	if connected {
+		// Forward directly
+		signalData, _ := json.Marshal(signal)
+		msg := Message{
+			Type:    "CALL_SIGNAL",
+			Sender:  n.address,
+			Content: string(signalData),
+		}
+		msgData, _ := json.Marshal(msg)
+		_, err := conn.Write(msgData)
+		if err != nil {
+			fmt.Printf("Failed to forward call signal: %v\n", err)
+		}
+	}
+
+	// Also store in the DHT for redundancy
+	signalKey := fmt.Sprintf("signal:%s:%s", signal.RecipientID, time.Now().Format(time.RFC3339Nano))
+	signalData, _ := json.Marshal(signal)
+	n.dht.StoreValue(signalKey, string(signalData))
+
+	return nil
+}
+
+// GetPendingCallSignals gets pending call signals for a user
+func (n *Node) GetPendingCallSignals(userID string) ([]*storage.EncryptedContent, error) {
+	if n.storage == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+
+	return n.storage.GetContentByType(userID, storage.TypeCallSignal)
 }

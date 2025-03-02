@@ -1,0 +1,19 @@
+=============== Mar 2, 2025 (CET) ===============
+01:20:48.701948 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+01:20:48.704018 db@open opening
+01:20:48.705045 version@stat F·[] S·0B[] Sc·[]
+01:20:48.706079 db@janitor F·2 G·0
+01:20:48.706079 db@open done T·2.0613ms
+01:20:48.847434 db@close closing
+01:20:48.847434 db@close done T·0s
+=============== Mar 2, 2025 (CET) ===============
+01:22:30.862874 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+01:22:30.863390 version@stat F·[] S·0B[] Sc·[]
+01:22:30.863390 db@open opening
+01:22:30.863908 journal@recovery F·1
+01:22:30.864423 journal@recovery recovering @1
+01:22:30.866720 version@stat F·[] S·0B[] Sc·[]
+01:22:30.869805 db@janitor F·2 G·0
+01:22:30.869805 db@open done T·6.4149ms
+01:24:58.355809 db@close closing
+01:24:58.356410 db@close done T·601µs
