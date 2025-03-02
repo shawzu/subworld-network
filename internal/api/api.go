@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const CmdFindAllUserContent = "FIND_ALL_USER_CONTENT"
+
 // NodeAPI handles client API requests
 type NodeAPI struct {
 	node            *network.Node
@@ -156,8 +158,11 @@ func (api *NodeAPI) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		content.Timestamp = time.Now()
 	}
 
-	// Store the message
-	if err := api.storage.StoreContent(&content); err != nil {
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Store and distribute the message
+	if err := storageManager.StoreContent(&content); err != nil {
 		http.Error(w, "Failed to store message: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -196,6 +201,7 @@ func (api *NodeAPI) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	sinceStr := r.URL.Query().Get("since")
 	limitStr := r.URL.Query().Get("limit")
 	onlyUndeliveredStr := r.URL.Query().Get("undelivered_only")
+	fetchRemoteStr := r.URL.Query().Get("fetch_remote")
 
 	var since time.Time
 	if sinceStr != "" {
@@ -218,8 +224,25 @@ func (api *NodeAPI) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		onlyUndelivered = true
 	}
 
-	// Get messages
-	messages, err := api.storage.GetMessagesByUser(userID, false)
+	fetchRemote := true // Default to true
+	if fetchRemoteStr == "false" {
+		fetchRemote = false
+	}
+
+	var messages []*storage.EncryptedContent
+	var err error
+
+	// Create a DHT storage manager if it doesn't exist
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch all content for this user from the network if requested
+	if fetchRemote {
+		// This will update our local storage with any remote content
+		storageManager.FetchAllUserContent(userID)
+	}
+
+	// Get messages from local storage (which may have been updated by the network fetch)
+	messages, err = api.storage.GetMessagesByUser(userID, false)
 	if err != nil {
 		http.Error(w, "Failed to get messages: "+err.Error(), http.StatusInternalServerError)
 		return

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -18,17 +19,17 @@ import (
 
 // Constants for node types and commands
 const (
-	BootstrapNode = "BOOTSTRAP"
-	RegularNode   = "REGULAR"
-
-	CmdJoinNetwork  = "JOIN_NETWORK"
-	CmdRequestPeers = "REQUEST_PEERS"
-	CmdPeersList    = "PEERS_LIST"
-	CmdHandshake    = "HANDSHAKE"
-	CmdMessage      = "MESSAGE"
-	CmdStoreContent = "STORE_CONTENT"
-	CmdFindContent  = "FIND_CONTENT"
-	CmdContentFound = "CONTENT_FOUND"
+	BootstrapNode         = "BOOTSTRAP"
+	RegularNode           = "REGULAR"
+	CmdFindAllUserContent = "FIND_ALL_USER_CONTENT"
+	CmdJoinNetwork        = "JOIN_NETWORK"
+	CmdRequestPeers       = "REQUEST_PEERS"
+	CmdPeersList          = "PEERS_LIST"
+	CmdHandshake          = "HANDSHAKE"
+	CmdMessage            = "MESSAGE"
+	CmdStoreContent       = "STORE_CONTENT"
+	CmdFindContent        = "FIND_CONTENT"
+	CmdContentFound       = "CONTENT_FOUND"
 )
 
 // NodeConfig contains the configuration for a node
@@ -459,6 +460,8 @@ func (n *Node) handlePeer(conn net.Conn) {
 
 		// Handle message based on type
 		switch msg.Type {
+		case CmdFindAllUserContent:
+			n.handleFindAllUserContent(conn, msg)
 		case CmdJoinNetwork:
 			n.handleJoinNetwork(conn, msg)
 		case CmdRequestPeers:
@@ -479,6 +482,56 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleContentFound(msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
+		}
+	}
+}
+
+func (n *Node) handleFindAllUserContent(conn net.Conn, msg Message) {
+	userID := msg.Content
+
+	// Get all content for this user
+	var allContent []*storage.EncryptedContent
+
+	// Get messages
+	messages, err := n.storage.GetMessagesByUser(userID, false)
+	if err == nil {
+		allContent = append(allContent, messages...)
+	}
+
+	// Get photos
+	photos, err := n.storage.GetContentByType(userID, storage.TypePhoto)
+	if err == nil {
+		allContent = append(allContent, photos...)
+	}
+
+	// Get voice messages
+	voiceMessages, err := n.storage.GetContentByType(userID, storage.TypeVoiceMessage)
+	if err == nil {
+		allContent = append(allContent, voiceMessages...)
+	}
+
+	// Don't include call signals - they're ephemeral
+
+	// If we have content, send it back
+	if len(allContent) > 0 {
+		// Send each content item separately to avoid large messages
+		for _, content := range allContent {
+			contentData, err := json.Marshal(content)
+			if err != nil {
+				continue
+			}
+
+			response := Message{
+				Type:    CmdStoreContent, // Receiver will store this content
+				Sender:  n.address,
+				Content: string(contentData),
+			}
+
+			responseData, _ := json.Marshal(response)
+			conn.Write(responseData)
+
+			// Small delay to avoid overwhelming the connection
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -578,6 +631,16 @@ func (n *Node) handleStoreContent(conn net.Conn, msg Message) {
 			return
 		}
 
+		// Check if we already have this content
+		existingMessages, _ := n.storage.GetMessagesByUser(content.RecipientID, true)
+		for _, existing := range existingMessages {
+			if existing.ID == content.ID && existing.Type == content.Type {
+				// Already have this content, no need to store again
+				fmt.Printf("Content ID %s already exists locally, not storing duplicate\n", content.ID)
+				return
+			}
+		}
+
 		// Store the content
 		err := n.storage.StoreContent(&content)
 		if err != nil {
@@ -586,10 +649,32 @@ func (n *Node) handleStoreContent(conn net.Conn, msg Message) {
 		}
 
 		fmt.Printf("Stored content ID %s for user %s\n", content.ID, content.RecipientID)
+
+		// Forward to other nodes that should have this content (except the sender)
+		// This helps with network propagation
+		if shouldForward := rand.Intn(10) < 3; shouldForward { // 30% chance to forward
+			contentKey := fmt.Sprintf("content:%s:%s", content.RecipientID, content.ID)
+			targetID := dht.NodeID(HashString(contentKey))
+			closestNodes := n.dht.FindClosestNodes(targetID, 3) // Forward to 3 nodes
+
+			for _, node := range closestNodes {
+				if node.ID.Equal(n.dht.LocalID) || node.Address == msg.Sender {
+					continue
+				}
+
+				if conn, ok := n.getPeerByAddress(node.Address); ok {
+					forwardMsg := Message{
+						Type:    CmdStoreContent,
+						Sender:  n.address,
+						Content: msg.Content,
+					}
+					forwardData, _ := json.Marshal(forwardMsg)
+					conn.Write(forwardData)
+				}
+			}
+		}
 	} else {
 		// If no storage configured, just keep in DHT
-		// This is a simplified approach - in a real system you'd parse the content
-		// and store with appropriate keys
 		contentID := fmt.Sprintf("content:%s", time.Now().Format(time.RFC3339Nano))
 		n.dht.StoreValue(contentID, msg.Content)
 	}

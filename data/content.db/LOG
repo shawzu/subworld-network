@@ -17,3 +17,26 @@
 01:22:30.869805 db@open done T·6.4149ms
 01:24:58.355809 db@close closing
 01:24:58.356410 db@close done T·601µs
+=============== Mar 2, 2025 (CET) ===============
+01:30:30.443743 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+01:30:30.444960 version@stat F·[] S·0B[] Sc·[]
+01:30:30.444960 db@open opening
+01:30:30.444960 journal@recovery F·1
+01:30:30.445477 journal@recovery recovering @2
+01:30:30.446010 version@stat F·[] S·0B[] Sc·[]
+01:30:30.450221 db@janitor F·2 G·0
+01:30:30.450221 db@open done T·5.2616ms
+02:01:30.736666 db@close closing
+02:01:30.736666 db@close done T·0s
+=============== Mar 2, 2025 (CET) ===============
+14:30:27.998407 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+14:30:27.999445 version@stat F·[] S·0B[] Sc·[]
+14:30:27.999445 db@open opening
+14:30:27.999445 journal@recovery F·1
+14:30:27.999965 journal@recovery recovering @4
+14:30:28.001512 memdb@flush created L0@6 N·2 S·407B "ind..800,v2":"msg..800,v1"
+14:30:28.002025 version@stat F·[1] S·407B[407B] Sc·[0.25]
+14:30:28.006239 db@janitor F·3 G·0
+14:30:28.006239 db@open done T·6.7945ms
+14:31:07.347569 db@close closing
+14:31:07.348122 db@close done T·553µs

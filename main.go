@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/signal"
 	"subworld-network/internal/api"
@@ -15,6 +16,7 @@ import (
 
 func main() {
 	// Parse command line flags
+	rand.Seed(time.Now().UnixNano())
 	isBootstrap := flag.Bool("bootstrap", false, "Force this node to run as a bootstrap node")
 	dataDir := flag.String("datadir", "./data", "Data directory for storage")
 	apiPort := flag.Int("apiport", 8081, "Port for the API server")
