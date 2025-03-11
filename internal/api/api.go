@@ -685,8 +685,8 @@ func (api *NodeAPI) handleRegisterUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register user with enhanced distribution
-	err := api.node.RegisterUser(request.Username)
+	// Register user with enhanced distribution, passing the public key
+	err := api.node.RegisterUser(request.Username, request.PublicKey)
 	if err != nil {
 		http.Error(w, "Failed to register user: "+err.Error(), http.StatusInternalServerError)
 		return

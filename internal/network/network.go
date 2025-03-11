@@ -1100,10 +1100,10 @@ func (n *Node) FindUser(username string) (string, bool) {
 }
 
 // RegisterUser registers a username in the DHT
-func (n *Node) RegisterUser(username string) error {
-	// Create user info with our address
-	userInfo := fmt.Sprintf("{\"username\":\"%s\",\"address\":\"%s\",\"public_key\":\"\"}",
-		username, n.address)
+func (n *Node) RegisterUser(username string, publicKey string) error {
+	// Create user info with our address and public key
+	userInfo := fmt.Sprintf("{\"username\":\"%s\",\"address\":\"%s\",\"public_key\":\"%s\"}",
+		username, n.address, publicKey)
 
 	// Create a storage manager
 	storageManager := NewDHTStorageManager(n, n.storage)
