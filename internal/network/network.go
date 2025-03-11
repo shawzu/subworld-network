@@ -641,6 +641,36 @@ func (n *Node) handleHandshake(conn net.Conn, msg Message) {
 
 // handleStoreContent handles a request to store content
 func (n *Node) handleStoreContent(conn net.Conn, msg Message) {
+	// First, check if this is a user info message
+	var contentMap map[string]interface{}
+	if err := json.Unmarshal([]byte(msg.Content), &contentMap); err == nil {
+		// This might be a user info message
+		if contentType, ok := contentMap["type"].(string); ok && contentType == "user_info" {
+			if key, ok := contentMap["key"].(string); ok {
+				if valueRaw, ok := contentMap["value"]; ok {
+					// Convert value to string if needed
+					var valueStr string
+					switch v := valueRaw.(type) {
+					case string:
+						valueStr = v
+					default:
+						// Try to convert to JSON string
+						if valueBytes, err := json.Marshal(v); err == nil {
+							valueStr = string(valueBytes)
+						}
+					}
+
+					if valueStr != "" {
+						// Store in DHT
+						n.dht.StoreValue(key, valueStr)
+						fmt.Printf("Stored user info for key: %s\n", key)
+						return
+					}
+				}
+			}
+		}
+	}
+
 	// If we have storage configured, store the content
 	if n.storage != nil {
 		var content storage.EncryptedContent

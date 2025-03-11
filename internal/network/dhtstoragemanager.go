@@ -226,12 +226,22 @@ func (m *DHTStorageManager) RegisterUser(username, userInfo string) error {
 	targetNodes := m.node.dht.FindClosestNodes(userID, ReplicationFactor)
 
 	// Create store message
-	storeMsg := Message{
-		Type:   CmdStoreContent,
-		Sender: m.node.address,
-		Content: fmt.Sprintf("{\"key\":\"%s\",\"value\":\"%s\",\"type\":\"user_info\"}",
-			userKey, userInfo),
+	contentObj := map[string]interface{}{
+		"key":   userKey,
+		"value": json.RawMessage(userInfo), // This treats userInfo as raw JSON
+		"type":  "user_info",
 	}
+	contentBytes, err := json.Marshal(contentObj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal user info: %w", err)
+	}
+
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  m.node.address,
+		Content: string(contentBytes),
+	}
+
 	msgData, _ := json.Marshal(storeMsg)
 
 	// Distribute to target nodes
