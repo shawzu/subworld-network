@@ -62,3 +62,14 @@
 15:06:00.793271 db@open done T·6.1734ms
 15:06:09.686362 db@close closing
 15:06:09.686362 db@close done T·0s
+=============== Mar 2, 2025 (CET) ===============
+15:25:11.595837 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+15:25:11.596860 version@stat F·[1] S·407B[407B] Sc·[0.25]
+15:25:11.596860 db@open opening
+15:25:11.596860 journal@recovery F·1
+15:25:11.597374 journal@recovery recovering @11
+15:25:11.598062 version@stat F·[1] S·407B[407B] Sc·[0.25]
+15:25:11.602726 db@janitor F·3 G·0
+15:25:11.602726 db@open done T·5.8666ms
+15:31:22.508318 db@close closing
+15:31:22.508318 db@close done T·0s

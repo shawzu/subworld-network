@@ -18,6 +18,11 @@ import (
 	"subworld-network/internal/storage"
 )
 
+var (
+	pendingUserLookups = make(map[string]chan string)
+	pendingUserMutex   sync.RWMutex
+)
+
 // Constants for node types and commands
 const (
 	BootstrapNode         = "BOOTSTRAP"
@@ -1364,7 +1369,9 @@ func (n *Node) handleFindUserInfo(conn net.Conn, msg Message) {
 	// Look up in local DHT
 	userInfo, found := n.dht.GetValue(userKey)
 	if !found {
-		// Not found
+		// Not found - instead of silently failing, we could forward
+		// the request to other nodes we know about
+		fmt.Printf("User %s not found locally\n", username)
 		return
 	}
 
@@ -1372,11 +1379,15 @@ func (n *Node) handleFindUserInfo(conn net.Conn, msg Message) {
 	response := Message{
 		Type:    CmdUserInfoResult,
 		Sender:  n.address,
-		Content: fmt.Sprintf("{\"username\":\"%s\",\"info\":\"%s\"}", username, userInfo),
+		Content: fmt.Sprintf("{\"username\":\"%s\",\"info\":%s}", username, userInfo),
 	}
 
 	responseData, _ := json.Marshal(response)
-	conn.Write(responseData)
+	if _, err := conn.Write(responseData); err != nil {
+		fmt.Printf("Failed to send user info result: %v\n", err)
+	} else {
+		fmt.Printf("Sent user info for %s\n", username)
+	}
 }
 
 // handleUserInfoResult handles user info lookup results
@@ -1398,7 +1409,21 @@ func (n *Node) handleUserInfoResult(conn net.Conn, msg Message) {
 
 	fmt.Printf("Received user info for %s from %s\n", result.Username, msg.Sender)
 
-	// In a full implementation, you would notify waiting requests
+	// Check if someone is waiting for this result
+	pendingUserMutex.RLock()
+	resultChan, exists := pendingUserLookups[result.Username]
+	pendingUserMutex.RUnlock()
+
+	if exists {
+		// Try to send it to the waiting goroutine
+		select {
+		case resultChan <- result.Info:
+			fmt.Printf("Successfully delivered user info for %s\n", result.Username)
+		default:
+			// Either the channel is full or the lookup has timed out
+			fmt.Printf("Could not deliver user info for %s, channel unavailable\n", result.Username)
+		}
+	}
 }
 
 // handleFindPhoto handles requests to find a photo

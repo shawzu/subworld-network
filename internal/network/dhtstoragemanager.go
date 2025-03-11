@@ -11,7 +11,7 @@ import (
 
 const (
 	// ReplicationFactor defines how many nodes should store each piece of content
-	ReplicationFactor = 5
+	ReplicationFactor = 10
 )
 
 // DHTStorageManager handles content distribution across the network
@@ -272,8 +272,20 @@ func (m *DHTStorageManager) FindUser(username string) (string, bool) {
 	userID := dht.NodeID(HashString(userKey))
 	closestNodes := m.node.dht.FindClosestNodes(userID, ReplicationFactor*2)
 
-	// Create channel for results
+	// Create channel for results and register it
 	resultChan := make(chan string, 1)
+
+	// Register the channel for this username lookup
+	pendingUserMutex.Lock()
+	pendingUserLookups[username] = resultChan
+	pendingUserMutex.Unlock()
+
+	// Make sure to clean up when we're done
+	defer func() {
+		pendingUserMutex.Lock()
+		delete(pendingUserLookups, username)
+		pendingUserMutex.Unlock()
+	}()
 
 	// Create find request
 	findReq := Message{
@@ -286,6 +298,9 @@ func (m *DHTStorageManager) FindUser(username string) (string, bool) {
 	// Track queried nodes
 	queriedNodes := make(map[string]bool)
 
+	// Count how many queries we actually sent
+	queriesSent := 0
+
 	// Query each node
 	for _, node := range closestNodes {
 		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
@@ -293,6 +308,7 @@ func (m *DHTStorageManager) FindUser(username string) (string, bool) {
 		}
 
 		queriedNodes[node.Address] = true
+		queriesSent++
 
 		go func(nodeAddr string) {
 			// Try to get existing connection
@@ -311,13 +327,18 @@ func (m *DHTStorageManager) FindUser(username string) (string, bool) {
 		}(node.Address)
 	}
 
+	// If we couldn't query any nodes, fail immediately
+	if queriesSent == 0 {
+		return "", false
+	}
+
 	// Wait for result or timeout
 	select {
 	case result := <-resultChan:
 		// Store locally for future queries
 		m.node.dht.StoreValue(userKey, result)
 		return result, true
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second): // Increased timeout
 		return "", false
 	}
 }
