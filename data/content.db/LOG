@@ -107,3 +107,14 @@
 18:05:21.007840 db@open done T·5.6964ms
 18:06:15.245340 db@close closing
 18:06:15.245898 db@close done T·557.7µs
+=============== Apr 2, 2025 (CEST) ===============
+01:54:57.423818 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+01:54:57.434584 version@stat F·[2] S·785B[785B] Sc·[0.50]
+01:54:57.434584 db@open opening
+01:54:57.435098 journal@recovery F·1
+01:54:57.435612 journal@recovery recovering @20
+01:54:57.436131 version@stat F·[2] S·785B[785B] Sc·[0.50]
+01:54:57.440288 db@janitor F·4 G·0
+01:54:57.440288 db@open done T·5.7033ms
+01:56:24.463713 db@close closing
+01:56:24.464280 db@close done T·567.4µs

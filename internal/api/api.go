@@ -86,6 +86,8 @@ func (api *NodeAPI) StartServer() error {
 	// Health check
 	mux.HandleFunc("/health", api.handleHealthCheck)
 
+	mux.HandleFunc("/nodes/list", api.handleNodesList)
+
 	// CORS middleware
 	handler := corsMiddleware(mux)
 
@@ -123,6 +125,42 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		fmt.Printf("[%s] %s %s %s\n", time.Since(start), r.Method, r.URL.Path, r.RemoteAddr)
 	})
+}
+
+// handleNodesList returns a list of all known nodes in the network
+func (api *NodeAPI) handleNodesList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get the filter query parameter (optional)
+	filterType := r.URL.Query().Get("type")
+	maxNodes := 100 // Default limit
+
+	// Get max parameter if provided
+	maxParam := r.URL.Query().Get("max")
+	if maxParam != "" {
+		if parsedMax, err := strconv.Atoi(maxParam); err == nil && parsedMax > 0 {
+			maxNodes = parsedMax
+		}
+	}
+
+	// Get all peers from DHT and direct connections
+	knownNodes := api.node.GetAllKnownNodes(filterType, maxNodes)
+
+	// Create response
+	response := struct {
+		Count int      `json:"count"`
+		Nodes []string `json:"nodes"`
+	}{
+		Count: len(knownNodes),
+		Nodes: knownNodes,
+	}
+
+	// Return the list
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleSendMessage handles a client request to send a message

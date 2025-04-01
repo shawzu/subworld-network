@@ -1520,3 +1520,88 @@ func (n *Node) handlePhotoResult(conn net.Conn, msg Message) {
 	}
 
 }
+
+// GetAllKnownNodes returns a list of all known nodes in the network
+// filterType can be "bootstrap", "regular", or "" for all nodes
+func (n *Node) GetAllKnownNodes(filterType string, limit int) []string {
+	nodes := make(map[string]bool)
+	result := []string{}
+
+	// Add ourselves first
+	nodes[n.address] = true
+
+	// Add our node type if it matches the filter or no filter
+	if filterType == "" || strings.ToLower(filterType) == strings.ToLower(n.nodeType) {
+		result = append(result, n.address)
+	}
+
+	// Add directly connected peers
+	n.peersMutex.RLock()
+	for peerAddr := range n.peers {
+		if _, exists := nodes[peerAddr]; !exists {
+			nodes[peerAddr] = true
+
+			// Check if we should include this node based on filter
+			if filterType != "" {
+				// Here we need to determine the node type
+				// For simplicity, we'll consider nodes with addresses matching bootstrap nodes as bootstrap nodes
+				isBootstrap := false
+				for _, bootstrapAddr := range n.bootstrapNodes {
+					if strings.HasPrefix(peerAddr, strings.Split(bootstrapAddr, ":")[0]) {
+						isBootstrap = true
+						break
+					}
+				}
+
+				nodeType := RegularNode
+				if isBootstrap {
+					nodeType = BootstrapNode
+				}
+
+				if strings.ToLower(filterType) != strings.ToLower(nodeType) {
+					continue
+				}
+			}
+
+			result = append(result, peerAddr)
+		}
+	}
+	n.peersMutex.RUnlock()
+
+	// Add nodes from DHT routing table
+	dhtPeers := n.dht.GetAllPeers()
+	for _, peer := range dhtPeers {
+		if _, exists := nodes[peer.Address]; !exists {
+			nodes[peer.Address] = true
+
+			// Apply the same filter logic as above
+			if filterType != "" {
+				isBootstrap := false
+				for _, bootstrapAddr := range n.bootstrapNodes {
+					if strings.HasPrefix(peer.Address, strings.Split(bootstrapAddr, ":")[0]) {
+						isBootstrap = true
+						break
+					}
+				}
+
+				nodeType := RegularNode
+				if isBootstrap {
+					nodeType = BootstrapNode
+				}
+
+				if strings.ToLower(filterType) != strings.ToLower(nodeType) {
+					continue
+				}
+			}
+
+			result = append(result, peer.Address)
+		}
+	}
+
+	// Apply limit
+	if len(result) > limit {
+		result = result[:limit]
+	}
+
+	return result
+}
