@@ -40,6 +40,9 @@ const (
 	CmdUserInfoResult     = "USER_INFO_RESULT"
 	CmdFindPhoto          = "FIND_PHOTO"
 	CmdPhotoResult        = "PHOTO_RESULT"
+
+	CmdFindFile   = "FIND_FILE"
+	CmdFileResult = "FILE_RESULT"
 )
 
 // NodeConfig contains the configuration for a node
@@ -498,6 +501,10 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleFindPhoto(conn, msg)
 		case CmdPhotoResult:
 			n.handlePhotoResult(conn, msg)
+		case CmdFindFile:
+			n.handleFindFile(conn, msg)
+		case CmdFileResult:
+			n.handleFileResult(conn, msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
@@ -551,6 +558,70 @@ func (n *Node) handleFindAllUserContent(conn net.Conn, msg Message) {
 			// Small delay to avoid overwhelming the connection
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+// handleFindFile handles requests to find a file
+func (n *Node) handleFindFile(conn net.Conn, msg Message) {
+	// Parse parameters
+	parts := strings.Split(msg.Content, ":")
+	if len(parts) != 3 {
+		return
+	}
+
+	userID := parts[0]
+	fileID := parts[1]
+	chunkIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+
+	// Look up in local storage
+	if n.storage == nil {
+		return
+	}
+
+	files, err := n.storage.GetContentByType(userID, storage.TypeFile)
+	if err != nil {
+		return
+	}
+
+	// Find matching file
+	for _, file := range files {
+		if file.ID == fileID && file.ChunkIndex == chunkIndex {
+			// Found it, send back
+			fileData, err := json.Marshal(file)
+			if err != nil {
+				return
+			}
+
+			response := Message{
+				Type:    CmdFileResult,
+				Sender:  n.address,
+				Content: string(fileData),
+			}
+
+			responseData, _ := json.Marshal(response)
+			conn.Write(responseData)
+			return
+		}
+	}
+}
+
+// handleFileResult handles file lookup results
+func (n *Node) handleFileResult(conn net.Conn, msg Message) {
+	// Parse result
+	var file storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &file); err != nil {
+		fmt.Printf("Invalid file result: %v\n", err)
+		return
+	}
+
+	// Store locally
+	if n.storage != nil {
+		n.storage.StoreContent(&file)
+		fmt.Printf("Received file %s chunk %d for user %s from %s\n",
+			file.ID, file.ChunkIndex, file.RecipientID, msg.Sender)
 	}
 }
 

@@ -276,6 +276,126 @@ func (m *DHTStorageManager) RegisterUser(username, userInfo string) error {
 	return nil
 }
 
+// StoreFile stores a file chunk and distributes it across the network
+func (m *DHTStorageManager) StoreFile(file *storage.EncryptedContent) error {
+	// Store locally first
+	if err := m.storage.StoreContent(file); err != nil {
+		return err
+	}
+
+	// Determine which nodes should store this file
+	fileKey := fmt.Sprintf("file:%s:%s:%d", file.RecipientID, file.ID, file.ChunkIndex)
+	fileHash := HashString(fileKey)
+	targetID := dht.NodeID(fileHash)
+
+	// Find closest nodes
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+	// Serialize the file
+	fileData, err := json.Marshal(file)
+	if err != nil {
+		return fmt.Errorf("failed to marshal file: %w", err)
+	}
+
+	// Create store message
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  m.node.address,
+		Content: string(fileData),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Distribute to target nodes
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) {
+			continue // Skip ourselves
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.Write(msgData)
+		} else {
+			// Try to establish connection
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.Write(msgData)
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchFile tries to find a file across the network
+func (m *DHTStorageManager) FetchFile(userID, fileID string, chunkIndex int) (*storage.EncryptedContent, error) {
+	// Try local storage first
+	files, err := m.storage.GetContentByType(userID, storage.TypeFile)
+	if err == nil {
+		for _, file := range files {
+			if file.ID == fileID && file.ChunkIndex == chunkIndex {
+				return file, nil
+			}
+		}
+	}
+
+	// Not found locally, search the network
+	fileKey := fmt.Sprintf("file:%s:%s:%d", userID, fileID, chunkIndex)
+	targetID := dht.NodeID(HashString(fileKey))
+
+	// Find nodes that might have this file
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create find file request
+	findReq := Message{
+		Type:    CmdFindFile,
+		Sender:  m.node.address,
+		Content: fmt.Sprintf("%s:%s:%d", userID, fileID, chunkIndex),
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Track queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Set up channel for results
+	resultChan := make(chan *storage.EncryptedContent, 1)
+
+	// Query each node
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		go func(nodeAddr string) {
+			if conn, ok := m.node.getPeerByAddress(nodeAddr); ok {
+				conn.Write(reqData)
+			} else {
+				if conn, err := net.Dial("tcp", nodeAddr); err == nil {
+					conn.Write(reqData)
+					m.node.peersMutex.Lock()
+					m.node.peers[nodeAddr] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}(node.Address)
+	}
+
+	// Wait for result or timeout
+	select {
+	case result := <-resultChan:
+		// Store locally for future queries
+		m.storage.StoreContent(result)
+		return result, nil
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("file not found in network")
+	}
+}
+
 // FindUser looks up a user across the network
 func (m *DHTStorageManager) FindUser(username string) (string, bool) {
 	// Try local DHT first

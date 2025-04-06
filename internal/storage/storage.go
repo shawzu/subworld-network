@@ -19,6 +19,7 @@ const (
 	TypePhoto
 	TypeVoiceMessage
 	TypeCallSignal
+	TypeFile
 )
 
 // EncryptedContent represents any content stored in the system
@@ -40,6 +41,11 @@ type EncryptedContent struct {
 	// For call signaling
 	TTL       int64     `json:"ttl,omitempty"` // Time-to-live in seconds
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
+
+	// For files
+	FileName string `json:"file_name,omitempty"`
+	FileType string `json:"file_type,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
 }
 
 // NodeStorage manages persistent storage for a node
