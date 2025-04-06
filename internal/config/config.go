@@ -47,7 +47,7 @@ func DefaultConfig() *AppConfig {
 		BootstrapNodes: []string{"93.4.27.35:8080"},
 		ListenPort:     8080,
 
-		APIPort:        8081,
+		APIPort:        8080,
 		APIBindAddress: "0.0.0.0",
 
 		DataDir:      "./data",

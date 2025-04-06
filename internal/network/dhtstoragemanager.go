@@ -20,6 +20,13 @@ type DHTStorageManager struct {
 	storage *storage.NodeStorage
 }
 
+type PhotoUploadResult struct {
+	ID         string `json:"id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Status     string `json:"status"`
+	TotalSize  int    `json:"total_size,omitempty"`
+}
+
 // NewDHTStorageManager creates a new storage manager
 func NewDHTStorageManager(node *Node, storage *storage.NodeStorage) *DHTStorageManager {
 	return &DHTStorageManager{
