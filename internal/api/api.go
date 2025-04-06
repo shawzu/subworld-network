@@ -404,12 +404,15 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Println("Upload photo request received")
+
 	// Limit upload size
 	r.Body = http.MaxBytesReader(w, r.Body, api.maxUploadSizeMB*1024*1024)
 
 	// Parse multipart form
 	err := r.ParseMultipartForm(api.maxUploadSizeMB * 1024 * 1024)
 	if err != nil {
+		fmt.Printf("Failed to parse form: %v\n", err)
 		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -421,7 +424,10 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 	chunkIndexStr := r.FormValue("chunk_index")
 	totalChunksStr := r.FormValue("total_chunks")
 
+	fmt.Printf("Photo upload data: recipient=%s, sender=%s, id=%s\n", recipientID, senderID, contentID)
+
 	if recipientID == "" || senderID == "" {
+		fmt.Println("Missing required parameters")
 		http.Error(w, "Missing required parameters", http.StatusBadRequest)
 		return
 	}
@@ -442,19 +448,25 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get file
-	file, _, err := r.FormFile("photo")
+	file, fileHeader, err := r.FormFile("photo")
 	if err != nil {
+		fmt.Printf("Failed to get file: %v\n", err)
 		http.Error(w, "Failed to get file: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
+	fmt.Printf("Received file: %s, size: %d bytes\n", fileHeader.Filename, fileHeader.Size)
+
 	// Read file data
 	data, err := io.ReadAll(file)
 	if err != nil {
+		fmt.Printf("Failed to read file: %v\n", err)
 		http.Error(w, "Failed to read file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	fmt.Printf("Read %d bytes of image data\n", len(data))
 
 	// Create content for metadata if first chunk
 	if chunkIndex == 0 {
@@ -473,7 +485,9 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 		storageManager := network.NewDHTStorageManager(api.node, api.storage)
 
 		// Store metadata with distribution
+		fmt.Println("Storing photo metadata in DHT")
 		if err := storageManager.StorePhoto(metaContent); err != nil {
+			fmt.Printf("Failed to store photo metadata: %v\n", err)
 			http.Error(w, "Failed to store photo metadata: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -495,10 +509,14 @@ func (api *NodeAPI) handleUploadPhoto(w http.ResponseWriter, r *http.Request) {
 	storageManager := network.NewDHTStorageManager(api.node, api.storage)
 
 	// Store the photo chunk with distributed replication
+	fmt.Printf("Storing photo chunk %d of %d in DHT\n", chunkIndex, totalChunks)
 	if err := storageManager.StorePhoto(content); err != nil {
+		fmt.Printf("Failed to store photo: %v\n", err)
 		http.Error(w, "Failed to store photo: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	fmt.Println("Photo stored successfully")
 
 	// Return success
 	w.Header().Set("Content-Type", "application/json")
@@ -522,7 +540,10 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 	photoID := r.URL.Query().Get("photo_id")
 	chunkStr := r.URL.Query().Get("chunk")
 
+	fmt.Printf("Photo get request: user=%s, photo=%s, chunk=%s\n", userID, photoID, chunkStr)
+
 	if userID == "" || photoID == "" {
+		fmt.Println("Missing required parameters")
 		http.Error(w, "Missing required parameters", http.StatusBadRequest)
 		return
 	}
@@ -534,19 +555,25 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 	if chunkStr != "" {
 		chunkIndex, err := strconv.Atoi(chunkStr)
 		if err != nil {
+			fmt.Printf("Invalid chunk index: %v\n", err)
 			http.Error(w, "Invalid chunk index", http.StatusBadRequest)
 			return
 		}
 
 		// Try to fetch the photo from the network
+		fmt.Printf("Fetching photo chunk %d from network\n", chunkIndex)
 		photo, err := storageManager.FetchPhoto(userID, photoID, chunkIndex)
 		if err != nil {
+			fmt.Printf("Chunk not found: %v\n", err)
 			http.Error(w, "Chunk not found", http.StatusNotFound)
 			return
 		}
 
+		fmt.Printf("Found photo chunk %d, size: %d bytes\n", chunkIndex, len(photo.EncryptedData))
+
 		// Return the chunk
 		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "inline")
 		w.Write([]byte(photo.EncryptedData))
 		return
 	}
