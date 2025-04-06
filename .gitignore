@@ -1,0 +1,36 @@
+# Data directory
+data/
+**/data/
+# LevelDB files
+*.ldb
+*.log
+CURRENT
+LOCK
+LOG
+MANIFEST-*
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Compiled binary
+subworld-network
+
+# Environment files
+.env
+
+# TLS certificates 
+*.crt
+*.key
+
+# Go build artifacts
+*.out
