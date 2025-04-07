@@ -331,11 +331,14 @@ func (m *DHTStorageManager) StoreFile(file *storage.EncryptedContent) error {
 
 // FetchFile tries to find a file across the network
 func (m *DHTStorageManager) FetchFile(userID, fileID string, chunkIndex int) (*storage.EncryptedContent, error) {
-	// Try local storage first
 	files, err := m.storage.GetContentByType(userID, storage.TypeFile)
 	if err == nil {
 		for _, file := range files {
 			if file.ID == fileID && file.ChunkIndex == chunkIndex {
+				// Ensure we have data in both fields
+				if len(file.RawData) == 0 && file.EncryptedData != "" {
+					file.RawData = []byte(file.EncryptedData)
+				}
 				return file, nil
 			}
 		}

@@ -29,6 +29,7 @@ type EncryptedContent struct {
 	RecipientID   string      `json:"recipient_id"`
 	Type          ContentType `json:"type"`
 	EncryptedData string      `json:"encrypted_data"` // Base64 encoded encrypted data
+	RawData       []byte      `json:"raw_data,omitempty"`
 	Timestamp     time.Time   `json:"timestamp"`
 	Delivered     bool        `json:"delivered"`
 	Read          bool        `json:"read"`
@@ -80,6 +81,13 @@ func (s *NodeStorage) StoreContent(content *EncryptedContent) error {
 	// Set timestamp if not provided
 	if content.Timestamp.IsZero() {
 		content.Timestamp = time.Now()
+	}
+
+	// Ensure we have data in both fields for compatibility
+	if len(content.RawData) > 0 && content.EncryptedData == "" {
+		content.EncryptedData = string(content.RawData)
+	} else if content.EncryptedData != "" && len(content.RawData) == 0 {
+		content.RawData = []byte(content.EncryptedData)
 	}
 
 	// Set expiry time for signals

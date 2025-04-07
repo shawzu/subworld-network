@@ -418,7 +418,6 @@ func (api *NodeAPI) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("Received file: %s, size: %d bytes\n", fileHeader.Filename, fileHeader.Size)
 
-	// Read file data
 	data, err := io.ReadAll(file)
 	if err != nil {
 		fmt.Printf("Failed to read file: %v\n", err)
@@ -458,19 +457,21 @@ func (api *NodeAPI) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Create content
 	content := &storage.EncryptedContent{
-		ID:            contentID,
-		SenderID:      senderID,
-		RecipientID:   recipientID,
-		Type:          storage.TypeFile,
-		EncryptedData: string(data), // Assumes data is already encrypted by client
-		Timestamp:     time.Now(),
-		ChunkIndex:    chunkIndex,
-		TotalChunks:   totalChunks,
-		FileName:      fileName,
-		FileType:      fileType,
-		FileSize:      fileHeader.Size,
+		ID:          contentID,
+		SenderID:    senderID,
+		RecipientID: recipientID,
+		Type:        storage.TypeFile,
+		// Store as string for backward compatibility
+		EncryptedData: string(data),
+		// Also store as raw bytes
+		RawData:     data,
+		Timestamp:   time.Now(),
+		ChunkIndex:  chunkIndex,
+		TotalChunks: totalChunks,
+		FileName:    fileName,
+		FileType:    fileType,
+		FileSize:    fileHeader.Size,
 	}
-
 	// Create storage manager
 	storageManager := network.NewDHTStorageManager(api.node, api.storage)
 
@@ -535,7 +536,9 @@ func (api *NodeAPI) handleGetFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fmt.Printf("Found file chunk %d, size: %d bytes\n", chunkIndex, len(file.EncryptedData))
+		// Check and log data sizes
+		fmt.Printf("Found file chunk %d, rawData size: %d bytes, encryptedData size: %d bytes\n",
+			chunkIndex, len(file.RawData), len(file.EncryptedData))
 
 		// Set content type if available
 		if file.FileType != "" {
@@ -551,7 +554,18 @@ func (api *NodeAPI) handleGetFile(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Disposition", "attachment")
 		}
 
-		w.Write([]byte(file.EncryptedData))
+		// Send data - try RawData first, fall back to EncryptedData
+		if len(file.RawData) > 0 {
+			fmt.Printf("Writing %d bytes of RawData\n", len(file.RawData))
+			w.Write(file.RawData)
+		} else if file.EncryptedData != "" {
+			fmt.Printf("Writing %d bytes from EncryptedData\n", len(file.EncryptedData))
+			w.Write([]byte(file.EncryptedData))
+		} else {
+			fmt.Println("WARNING: No data available for file chunk")
+			http.Error(w, "File chunk has no data", http.StatusInternalServerError)
+			return
+		}
 		return
 	}
 
