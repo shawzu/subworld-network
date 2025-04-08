@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -20,6 +21,7 @@ const (
 	TypeVoiceMessage
 	TypeCallSignal
 	TypeFile
+	TypeVoiceStream
 )
 
 // EncryptedContent represents any content stored in the system
@@ -95,6 +97,25 @@ func (s *NodeStorage) StoreContent(content *EncryptedContent) error {
 		content.ExpiresAt = time.Now().Add(time.Duration(content.TTL) * time.Second)
 	}
 
+	// Special handling for voice streams
+	if content.Type == TypeVoiceStream {
+		// For voice streams, check if we have too many chunks
+		recipientChunks, _ := s.GetContentByType(content.RecipientID, TypeVoiceStream)
+		if len(recipientChunks) > 1000 { // If we have more than 1000 chunks
+			// Sort by age (oldest first)
+			sort.Slice(recipientChunks, func(i, j int) bool {
+				return recipientChunks[i].Timestamp.Before(recipientChunks[j].Timestamp)
+			})
+
+			// Delete the oldest 200 chunks
+			chunksToDelete := recipientChunks[:200]
+			for _, oldChunk := range chunksToDelete {
+				key := fmt.Sprintf("voice:%s:%s:%s", oldChunk.RecipientID, oldChunk.ID, oldChunk.Timestamp.Format(time.RFC3339Nano))
+				s.db.Delete([]byte(key), nil)
+			}
+		}
+	}
+
 	// Generate key
 	var key string
 	switch content.Type {
@@ -106,6 +127,10 @@ func (s *NodeStorage) StoreContent(content *EncryptedContent) error {
 		key = fmt.Sprintf("voice:%s:%s:%s", content.RecipientID, time.Now().Format(time.RFC3339Nano), content.ID)
 	case TypeCallSignal:
 		key = fmt.Sprintf("signal:%s:%s:%s", content.RecipientID, content.ID, time.Now().Format(time.RFC3339Nano))
+	case TypeVoiceStream:
+		key = fmt.Sprintf("voice:%s:%s:%s", content.RecipientID, content.ID, time.Now().Format(time.RFC3339Nano))
+	case TypeFile:
+		key = fmt.Sprintf("file:%s:%s:%d:%s", content.RecipientID, content.ID, content.ChunkIndex, time.Now().Format(time.RFC3339Nano))
 	}
 
 	// Also store in recipient index
@@ -123,7 +148,8 @@ func (s *NodeStorage) StoreContent(content *EncryptedContent) error {
 	}
 
 	// Store in index (except for call signals which expire quickly)
-	if content.Type != TypeCallSignal {
+	// Also don't index voice streams as they're transient
+	if content.Type != TypeCallSignal && content.Type != TypeVoiceStream {
 		return s.db.Put([]byte(indexKey), []byte(key), nil)
 	}
 
@@ -279,7 +305,7 @@ func (s *NodeStorage) PermanentlyDeleteContent(userID string, contentIDs []strin
 	return nil
 }
 
-// CleanupExpiredContent removes expired content (like call signals)
+// CleanupExpiredContent removes expired content (like call signals and voice streams)
 func (s *NodeStorage) CleanupExpiredContent() error {
 	now := time.Now()
 
@@ -297,6 +323,21 @@ func (s *NodeStorage) CleanupExpiredContent() error {
 		}
 	}
 	iter.Release()
+
+	// Find expired voice streams (they expire much faster than other content)
+	voiceIter := s.db.NewIterator(util.BytesPrefix([]byte("voice:")), nil)
+	for voiceIter.Next() {
+		var content EncryptedContent
+		if err := json.Unmarshal(voiceIter.Value(), &content); err != nil {
+			continue
+		}
+
+		// Voice streams expire after 60 seconds by default
+		if time.Since(content.Timestamp) > 60*time.Second {
+			s.db.Delete(voiceIter.Key(), nil)
+		}
+	}
+	voiceIter.Release()
 
 	return nil
 }

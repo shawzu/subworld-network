@@ -43,6 +43,9 @@ const (
 
 	CmdFindFile   = "FIND_FILE"
 	CmdFileResult = "FILE_RESULT"
+
+	CmdFindVoiceStream   = "FIND_VOICE_STREAM"
+	CmdVoiceStreamResult = "VOICE_STREAM_RESULT"
 )
 
 // NodeConfig contains the configuration for a node
@@ -505,6 +508,10 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleFindFile(conn, msg)
 		case CmdFileResult:
 			n.handleFileResult(conn, msg)
+		case CmdFindVoiceStream:
+			n.handleFindVoiceStream(conn, msg)
+		case CmdVoiceStreamResult:
+			n.handleVoiceStreamResult(conn, msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
@@ -1460,6 +1467,85 @@ func (n *Node) GetPendingCallSignals(userID string) ([]*storage.EncryptedContent
 	}
 
 	return n.storage.GetContentByType(userID, storage.TypeCallSignal)
+}
+
+// handleFindVoiceStream handles requests to find voice stream chunks
+func (n *Node) handleFindVoiceStream(conn net.Conn, msg Message) {
+	// Parse parameters (recipientID:callSessionID or just recipientID)
+	parts := strings.Split(msg.Content, ":")
+	if len(parts) < 1 {
+		return
+	}
+
+	recipientID := parts[0]
+	callSessionID := ""
+	if len(parts) > 1 {
+		callSessionID = parts[1]
+	}
+
+	// Look up in local storage
+	if n.storage == nil {
+		return
+	}
+
+	chunks, err := n.storage.GetContentByType(recipientID, storage.TypeVoiceStream)
+	if err != nil {
+		return
+	}
+
+	// Filter by call session if provided
+	if callSessionID != "" {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range chunks {
+			if strings.HasPrefix(chunk.ID, callSessionID) || chunk.ID == callSessionID {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		chunks = filteredChunks
+	}
+
+	// Limit to 10 most recent chunks to prevent flooding
+	if len(chunks) > 10 {
+		// Sort by timestamp first (newer first)
+		sort.Slice(chunks, func(i, j int) bool {
+			return chunks[i].Timestamp.After(chunks[j].Timestamp)
+		})
+		chunks = chunks[:10]
+	}
+
+	// Send chunks back
+	for _, chunk := range chunks {
+		chunkData, err := json.Marshal(chunk)
+		if err != nil {
+			continue
+		}
+
+		response := Message{
+			Type:    CmdVoiceStreamResult,
+			Sender:  n.address,
+			Content: string(chunkData),
+		}
+
+		responseData, _ := json.Marshal(response)
+		conn.Write(responseData)
+
+		// Brief delay to prevent flooding
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// handleVoiceStreamResult processes voice stream chunk results
+func (n *Node) handleVoiceStreamResult(conn net.Conn, msg Message) {
+	// Parse chunk data
+	var chunk storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &chunk); err != nil {
+		return
+	}
+
+	// Store locally if we have storage
+	if n.storage != nil {
+		n.storage.StoreContent(&chunk)
+	}
 }
 
 // handleFindUserInfo handles requests to find user information

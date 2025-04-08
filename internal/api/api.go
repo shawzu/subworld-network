@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"subworld-network/internal/network"
@@ -72,10 +73,6 @@ func (api *NodeAPI) StartServer() error {
 	mux.HandleFunc("/photos/upload", api.handleUploadPhoto)
 	mux.HandleFunc("/photos/get", api.handleGetPhoto)
 
-	// Call signaling endpoints
-	mux.HandleFunc("/calls/signal", api.handleCallSignal)
-	mux.HandleFunc("/calls/pending", api.handleGetPendingCallSignals)
-
 	// User endpoints
 	mux.HandleFunc("/users/find", api.handleFindUser)
 	mux.HandleFunc("/users/register", api.handleRegisterUser)
@@ -90,6 +87,11 @@ func (api *NodeAPI) StartServer() error {
 
 	mux.HandleFunc("/files/upload", api.handleFileUpload)
 	mux.HandleFunc("/files/get", api.handleGetFile)
+
+	mux.HandleFunc("/voice/start", api.handleStartVoiceCall)
+	mux.HandleFunc("/voice/stream", api.handleVoiceStream)
+	mux.HandleFunc("/voice/fetch", api.handleFetchVoiceStream)
+	mux.HandleFunc("/voice/end", api.handleEndVoiceCall)
 
 	// CORS middleware
 	handler := corsMiddleware(mux)
@@ -127,6 +129,264 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		fmt.Printf("[%s] %s %s %s\n", time.Since(start), r.Method, r.URL.Path, r.RemoteAddr)
+	})
+}
+
+// handleStartVoiceCall initiates a voice call session
+func (api *NodeAPI) handleStartVoiceCall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	var request struct {
+		CallerId      string `json:"caller_id"`
+		RecipientId   string `json:"recipient_id"`
+		CallSessionId string `json:"call_session_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if request.CallerId == "" || request.RecipientId == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Generate call session ID if not provided
+	callSessionId := request.CallSessionId
+	if callSessionId == "" {
+		callSessionId = fmt.Sprintf("call-%s-%d", request.CallerId, time.Now().UnixNano())
+	}
+
+	// Create a call start notification
+	notification := &storage.EncryptedContent{
+		ID:            callSessionId,
+		SenderID:      request.CallerId,
+		RecipientID:   request.RecipientId,
+		Type:          storage.TypeVoiceStream,
+		EncryptedData: "{\"type\":\"call_start\",\"timestamp\":" + strconv.FormatInt(time.Now().Unix(), 10) + "}",
+		Timestamp:     time.Now(),
+		TTL:           300, // 5 minutes TTL
+	}
+
+	// Store notification
+	if err := api.storage.StoreContent(notification); err != nil {
+		http.Error(w, "Failed to store call notification: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+	storageManager.StoreContent(notification)
+
+	// Return success with call session ID
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":          "success",
+		"call_session_id": callSessionId,
+	})
+}
+
+// handleVoiceStream handles voice data stream chunks
+func (api *NodeAPI) handleVoiceStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Limit upload size
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024) // Limit to 64KB per chunk
+
+	// Parse request body
+	var request struct {
+		CallSessionId string `json:"call_session_id"`
+		SenderId      string `json:"sender_id"`
+		RecipientId   string `json:"recipient_id"`
+		ChunkId       string `json:"chunk_id"`
+		AudioData     string `json:"audio_data"` // Base64 encoded encrypted audio
+		Timestamp     int64  `json:"timestamp"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if request.CallSessionId == "" || request.SenderId == "" ||
+		request.RecipientId == "" || request.AudioData == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Generate chunk ID if not provided
+	chunkId := request.ChunkId
+	if chunkId == "" {
+		chunkId = fmt.Sprintf("%s-%d", request.CallSessionId, time.Now().UnixNano())
+	}
+
+	// Create voice chunk content
+	chunk := &storage.EncryptedContent{
+		ID:            chunkId,
+		SenderID:      request.SenderId,
+		RecipientID:   request.RecipientId,
+		Type:          storage.TypeVoiceStream,
+		EncryptedData: request.AudioData,
+		Timestamp:     time.Now(),
+		TTL:           60, // 60 seconds TTL for audio chunks
+	}
+
+	// Store chunk locally
+	if err := api.storage.StoreContent(chunk); err != nil {
+		http.Error(w, "Failed to store voice chunk: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+	storageManager.StoreContent(chunk)
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":   "success",
+		"chunk_id": chunkId,
+	})
+}
+
+// handleFetchVoiceStream fetches voice stream chunks for a recipient
+func (api *NodeAPI) handleFetchVoiceStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get query parameters
+	recipientId := r.URL.Query().Get("recipient_id")
+	callSessionId := r.URL.Query().Get("call_session_id")
+	sinceTimestamp := r.URL.Query().Get("since_timestamp")
+
+	// Validate required parameters
+	if recipientId == "" {
+		http.Error(w, "Missing recipient_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Default to fetching all chunks for this recipient if call session not specified
+	var chunks []*storage.EncryptedContent
+	var err error
+
+	// Create a DHT storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch all content for this user from the network
+	storageManager.FetchAllUserContent(recipientId)
+
+	// Get voice stream chunks from local storage (might have been updated by network fetch)
+	chunks, err = api.storage.GetContentByType(recipientId, storage.TypeVoiceStream)
+	if err != nil {
+		http.Error(w, "Failed to get voice chunks: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter by call session if specified
+	if callSessionId != "" {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range chunks {
+			// Check if the chunk belongs to this call session
+			// We assume the call session ID is at the beginning of the chunk ID
+			if strings.HasPrefix(chunk.ID, callSessionId) || chunk.ID == callSessionId {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		chunks = filteredChunks
+	}
+
+	// Filter by timestamp if specified
+	if sinceTimestamp != "" {
+		timestamp, err := strconv.ParseInt(sinceTimestamp, 10, 64)
+		if err == nil {
+			since := time.Unix(timestamp, 0)
+			var filteredChunks []*storage.EncryptedContent
+			for _, chunk := range chunks {
+				if chunk.Timestamp.After(since) {
+					filteredChunks = append(filteredChunks, chunk)
+				}
+			}
+			chunks = filteredChunks
+		}
+	}
+
+	// Sort chunks by timestamp (newer first)
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].Timestamp.After(chunks[j].Timestamp)
+	})
+
+	// Limit to 50 most recent chunks to prevent excessive response size
+	if len(chunks) > 50 {
+		chunks = chunks[:50]
+	}
+
+	// Return chunks
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(chunks)
+}
+
+// handleEndVoiceCall ends a voice call session
+func (api *NodeAPI) handleEndVoiceCall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	var request struct {
+		CallSessionId string `json:"call_session_id"`
+		SenderId      string `json:"sender_id"`
+		RecipientId   string `json:"recipient_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if request.CallSessionId == "" || request.SenderId == "" || request.RecipientId == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Create call end notification
+	notification := &storage.EncryptedContent{
+		ID:            fmt.Sprintf("%s-end", request.CallSessionId),
+		SenderID:      request.SenderId,
+		RecipientID:   request.RecipientId,
+		Type:          storage.TypeVoiceStream,
+		EncryptedData: "{\"type\":\"call_end\",\"timestamp\":" + strconv.FormatInt(time.Now().Unix(), 10) + "}",
+		Timestamp:     time.Now(),
+		TTL:           300, // 5 minutes TTL
+	}
+
+	// Store notification
+	if err := api.storage.StoreContent(notification); err != nil {
+		http.Error(w, "Failed to store call end notification: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+	storageManager.StoreContent(notification)
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
 	})
 }
 
@@ -898,79 +1158,6 @@ func (api *NodeAPI) handleGetPhoto(w http.ResponseWriter, r *http.Request) {
 	// Return metadata
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(photoMeta)
-}
-
-// handleCallSignal handles call signaling
-func (api *NodeAPI) handleCallSignal(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse request
-	var signal storage.EncryptedContent
-	if err := json.NewDecoder(r.Body).Decode(&signal); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Validate required fields
-	if signal.RecipientID == "" || signal.SenderID == "" || signal.EncryptedData == "" {
-		http.Error(w, "Missing required fields", http.StatusBadRequest)
-		return
-	}
-
-	// Set type and TTL
-	signal.Type = storage.TypeCallSignal
-	signal.TTL = 300 // 5 minutes
-
-	// Generate ID if not provided
-	if signal.ID == "" {
-		signal.ID = fmt.Sprintf("signal-%d", time.Now().UnixNano())
-	}
-
-	// Store signal
-	if err := api.storage.StoreContent(&signal); err != nil {
-		http.Error(w, "Failed to store signal: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Try to deliver directly
-	api.node.HandleCallSignal(&signal)
-
-	// Return success
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "success",
-		"id":     signal.ID,
-	})
-}
-
-// handleGetPendingCallSignals gets pending call signals for a user
-func (api *NodeAPI) handleGetPendingCallSignals(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Get user ID from query
-	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
-		return
-	}
-
-	// Get pending call signals
-	signals, err := api.storage.GetContentByType(userID, storage.TypeCallSignal)
-	if err != nil {
-		http.Error(w, "Failed to get call signals: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Return signals
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(signals)
 }
 
 // handleFindUser handles user lookup

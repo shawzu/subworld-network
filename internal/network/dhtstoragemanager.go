@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"subworld-network/internal/dht"
 	"subworld-network/internal/storage"
 	"time"
@@ -397,6 +398,174 @@ func (m *DHTStorageManager) FetchFile(userID, fileID string, chunkIndex int) (*s
 	case <-time.After(2 * time.Second):
 		return nil, fmt.Errorf("file not found in network")
 	}
+}
+
+// StoreVoiceStream stores voice stream chunks to the DHT
+func (m *DHTStorageManager) StoreVoiceStream(content *storage.EncryptedContent) error {
+	// Store locally first
+	if err := m.storage.StoreContent(content); err != nil {
+		return err
+	}
+
+	// Determine which nodes should store this content
+	contentKey := fmt.Sprintf("voice:%s:%s", content.RecipientID, content.ID)
+	contentHash := HashString(contentKey)
+	targetID := dht.NodeID(contentHash)
+
+	// Find the closest nodes to this content key
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+	// Serialize the content
+	contentData, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("failed to marshal voice content: %w", err)
+	}
+
+	// Create store message
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  m.node.address,
+		Content: string(contentData),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Replicate to target nodes - prioritize fast delivery for voice
+	for _, targetNode := range closestNodes {
+		// Skip if it's ourselves - we already stored it
+		if targetNode.ID.Equal(m.node.dht.LocalID) {
+			continue
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(targetNode.Address); ok {
+			// Set a short deadline for voice data to ensure fresh data
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			conn.Write(msgData)
+			conn.SetWriteDeadline(time.Time{}) // Reset deadline
+		} else {
+			// Try to establish connection if not connected
+			if conn, err := net.Dial("tcp", targetNode.Address); err == nil {
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				conn.Write(msgData)
+				conn.SetWriteDeadline(time.Time{}) // Reset deadline
+
+				// Add to peers and handle future messages
+				m.node.peersMutex.Lock()
+				m.node.peers[targetNode.Address] = conn
+				m.node.peersMutex.Unlock()
+
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchVoiceStream fetches voice stream chunks for a recipient
+func (m *DHTStorageManager) FetchVoiceStream(recipientID, callSessionID string, since time.Time) ([]*storage.EncryptedContent, error) {
+	// Try local storage first
+	chunks, err := m.storage.GetContentByType(recipientID, storage.TypeVoiceStream)
+
+	// Filter by call session if provided
+	if callSessionID != "" && err == nil {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range chunks {
+			if strings.HasPrefix(chunk.ID, callSessionID) || chunk.ID == callSessionID {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		chunks = filteredChunks
+	}
+
+	// Filter by timestamp
+	if !since.IsZero() && err == nil {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range chunks {
+			if chunk.Timestamp.After(since) {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		chunks = filteredChunks
+	}
+
+	// Build lookup key for content in the DHT
+	voiceKey := fmt.Sprintf("voice:%s", recipientID)
+	targetID := dht.NodeID(HashString(voiceKey))
+
+	// Find nodes that might have voice data for this user
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create request message
+	findReq := Message{
+		Type:    CmdFindVoiceStream,
+		Sender:  m.node.address,
+		Content: fmt.Sprintf("%s:%s", recipientID, callSessionID),
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Keep track of which nodes we've queried
+	queriedNodes := make(map[string]bool)
+
+	// Query each node
+	for _, node := range closestNodes {
+		// Skip if it's ourselves or already queried
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		// Send request with short timeout for voice data
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			conn.Write(reqData)
+			conn.SetWriteDeadline(time.Time{}) // Reset deadline
+		} else {
+			// Try to establish connection if not connected
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				conn.Write(reqData)
+				conn.SetWriteDeadline(time.Time{}) // Reset deadline
+
+				// Add to peers and handle future messages
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	// Short wait for responses to arrive
+	time.Sleep(500 * time.Millisecond)
+
+	// Get updated content (which may have been updated by responses)
+	updatedChunks, _ := m.storage.GetContentByType(recipientID, storage.TypeVoiceStream)
+
+	// Re-filter with the same criteria
+	if callSessionID != "" {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range updatedChunks {
+			if strings.HasPrefix(chunk.ID, callSessionID) || chunk.ID == callSessionID {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		updatedChunks = filteredChunks
+	}
+
+	if !since.IsZero() {
+		var filteredChunks []*storage.EncryptedContent
+		for _, chunk := range updatedChunks {
+			if chunk.Timestamp.After(since) {
+				filteredChunks = append(filteredChunks, chunk)
+			}
+		}
+		updatedChunks = filteredChunks
+	}
+
+	return updatedChunks, nil
 }
 
 // FindUser looks up a user across the network
