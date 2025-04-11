@@ -46,6 +46,14 @@ const (
 
 	CmdFindVoiceStream   = "FIND_VOICE_STREAM"
 	CmdVoiceStreamResult = "VOICE_STREAM_RESULT"
+
+	CmdStoreGroupInfo      = "STORE_GROUP_INFO"
+	CmdFindGroupInfo       = "FIND_GROUP_INFO"
+	CmdGroupInfoResult     = "GROUP_INFO_RESULT"
+	CmdFindUserGroups      = "FIND_USER_GROUPS"
+	CmdUserGroupsResult    = "USER_GROUPS_RESULT"
+	CmdFindGroupMessages   = "FIND_GROUP_MESSAGES"
+	CmdGroupMessagesResult = "GROUP_MESSAGES_RESULT"
 )
 
 // NodeConfig contains the configuration for a node
@@ -53,7 +61,7 @@ type NodeConfig struct {
 	BootstrapNodes []string // List of bootstrap node IPs
 	ForceBootstrap bool     // Force this node to be a bootstrap node
 	ListenPort     int      // Port to listen on (default: 8080)
-	MaxPeers       int      // Maximum number of peers (default: 100)
+	MaxPeers       int      // Maximum number of peers
 }
 
 type NodeInfoMessage struct {
@@ -512,6 +520,20 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleFindVoiceStream(conn, msg)
 		case CmdVoiceStreamResult:
 			n.handleVoiceStreamResult(conn, msg)
+		case CmdStoreGroupInfo:
+			n.handleStoreGroupInfo(conn, msg)
+		case CmdFindGroupInfo:
+			n.handleFindGroupInfo(conn, msg)
+		case CmdGroupInfoResult:
+			n.handleGroupInfoResult(msg)
+		case CmdFindUserGroups:
+			n.handleFindUserGroups(conn, msg)
+		case CmdUserGroupsResult:
+			n.handleUserGroupsResult(msg)
+		case CmdFindGroupMessages:
+			n.handleFindGroupMessages(conn, msg)
+		case CmdGroupMessagesResult:
+			n.handleGroupMessagesResult(msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
@@ -1761,4 +1783,231 @@ func (n *Node) GetAllKnownNodes(filterType string, limit int) []string {
 	}
 
 	return result
+}
+
+// Handler for storing group info
+func (n *Node) handleStoreGroupInfo(conn net.Conn, msg Message) {
+	// Parse the group info
+	var group storage.GroupInfo
+	if err := json.Unmarshal([]byte(msg.Content), &group); err != nil {
+		fmt.Printf("Invalid group info in message: %v\n", err)
+		return
+	}
+
+	// Store in local storage if available
+	if n.storage != nil {
+		if err := n.storage.StoreGroup(&group); err != nil {
+			fmt.Printf("Failed to store group: %v\n", err)
+			return
+		}
+
+		// Also store membership indexes for all members
+		for _, memberID := range group.Members {
+			n.storage.StoreGroupMemberIndex(memberID, group.ID)
+		}
+
+		fmt.Printf("Stored group %s with %d members\n", group.ID, len(group.Members))
+	}
+
+	// Also store in the DHT
+	groupKey := fmt.Sprintf("group:%s", group.ID)
+	n.dht.StoreValue(groupKey, msg.Content)
+}
+
+// Handler for finding group info
+func (n *Node) handleFindGroupInfo(conn net.Conn, msg Message) {
+	groupID := msg.Content
+
+	// Try to get from local storage
+	var group *storage.GroupInfo
+	var groupData string
+
+	if n.storage != nil {
+		var err error
+		group, err = n.storage.GetGroup(groupID)
+		if err == nil {
+			// Found in storage
+			groupBytes, _ := json.Marshal(group)
+			groupData = string(groupBytes)
+		}
+	}
+
+	// If not in storage, try DHT
+	if groupData == "" {
+		groupKey := fmt.Sprintf("group:%s", groupID)
+		var found bool
+		groupData, found = n.dht.GetValue(groupKey)
+		if !found {
+			fmt.Printf("Group %s not found locally\n", groupID)
+			return
+		}
+	}
+
+	// Send back the result
+	response := Message{
+		Type:    CmdGroupInfoResult,
+		Sender:  n.address,
+		Content: groupData,
+	}
+
+	respData, _ := json.Marshal(response)
+	conn.Write(respData)
+}
+
+// / Handler for group info lookup results
+func (n *Node) handleGroupInfoResult(msg Message) {
+	// Parse the group info
+	var group storage.GroupInfo
+	if err := json.Unmarshal([]byte(msg.Content), &group); err != nil {
+		fmt.Printf("Invalid group info in result: %v\n", err)
+		return
+	}
+
+	// Store it locally
+	if n.storage != nil {
+		if err := n.storage.StoreGroup(&group); err != nil {
+			fmt.Printf("Failed to store group from result: %v\n", err)
+			return
+		}
+
+		// Also store membership indexes for all members
+		for _, memberID := range group.Members {
+			// Use helper method instead of direct db access
+			if err := n.storage.StoreGroupMemberIndex(memberID, group.ID); err != nil {
+				fmt.Printf("Warning: Failed to store group member index for %s: %v\n", memberID, err)
+			}
+		}
+
+		fmt.Printf("Stored group %s from lookup result\n", group.ID)
+	}
+}
+
+// Handler for finding user's groups
+func (n *Node) handleFindUserGroups(conn net.Conn, msg Message) {
+	userID := msg.Content
+
+	// Get groups from local storage
+	if n.storage == nil {
+		return
+	}
+
+	groups, err := n.storage.GetUserGroups(userID)
+	if err != nil || len(groups) == 0 {
+		return
+	}
+
+	// Send each group back
+	for _, group := range groups {
+		groupData, err := json.Marshal(group)
+		if err != nil {
+			continue
+		}
+
+		response := Message{
+			Type:    CmdUserGroupsResult,
+			Sender:  n.address,
+			Content: string(groupData),
+		}
+
+		respData, _ := json.Marshal(response)
+		conn.Write(respData)
+
+		// Small delay to avoid overwhelming the connection
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Handler for user groups lookup results
+func (n *Node) handleUserGroupsResult(msg Message) {
+	// Parse the group info
+	var group storage.GroupInfo
+	if err := json.Unmarshal([]byte(msg.Content), &group); err != nil {
+		fmt.Printf("Invalid group info in result: %v\n", err)
+		return
+	}
+
+	// Store it locally
+	if n.storage != nil {
+		if err := n.storage.StoreGroup(&group); err != nil {
+			fmt.Printf("Failed to store group from result: %v\n", err)
+			return
+		}
+
+		// Also store membership indexes for all members
+		for _, memberID := range group.Members {
+			// Use helper method instead of direct db access
+			if err := n.storage.StoreGroupMemberIndex(memberID, group.ID); err != nil {
+				fmt.Printf("Warning: Failed to store group member index for %s: %v\n", memberID, err)
+			}
+		}
+	}
+}
+
+// Handler for finding group messages
+func (n *Node) handleFindGroupMessages(conn net.Conn, msg Message) {
+	groupID := msg.Content
+
+	// Get messages from local storage
+	if n.storage == nil {
+		return
+	}
+
+	messages, err := n.storage.GetGroupMessages(groupID, 50) // Limit to 50 most recent
+	if err != nil || len(messages) == 0 {
+		return
+	}
+
+	// Send each message back
+	for _, message := range messages {
+		messageData, err := json.Marshal(message)
+		if err != nil {
+			continue
+		}
+
+		response := Message{
+			Type:    CmdGroupMessagesResult,
+			Sender:  n.address,
+			Content: string(messageData),
+		}
+
+		respData, _ := json.Marshal(response)
+		conn.Write(respData)
+
+		// Small delay to avoid overwhelming the connection
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Handler for group messages results
+func (n *Node) handleGroupMessagesResult(msg Message) {
+	// Parse the message
+	var content storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &content); err != nil {
+		fmt.Printf("Invalid content in result: %v\n", err)
+		return
+	}
+
+	// Store it locally
+	if n.storage != nil {
+		if err := n.storage.StoreContent(&content); err != nil {
+			fmt.Printf("Failed to store message from result: %v\n", err)
+			return
+		}
+
+		// Also store the message index if it's a group message
+		if content.IsGroupMsg && content.GroupID != "" {
+			// Create content key
+			contentKey := fmt.Sprintf("groupmsg:%s:%s:%s", content.GroupID, content.ID, content.Timestamp.Format(time.RFC3339Nano))
+
+			// Use helper method instead of direct db access
+			if err := n.storage.StoreGroupMessageIndex(content.GroupID, content.ID, contentKey); err != nil {
+				fmt.Printf("Warning: Failed to store group message index: %v\n", err)
+			}
+		}
+	}
+}
+
+// StoreDHTValue stores a value in the node's DHT
+func (n *Node) StoreDHTValue(key string, value string) {
+	n.dht.StoreValue(key, value)
 }

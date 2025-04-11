@@ -771,3 +771,295 @@ func (m *DHTStorageManager) FetchPhoto(userID, photoID string, chunkIndex int) (
 		return nil, fmt.Errorf("photo not found in network")
 	}
 }
+
+// StoreGroupInfo stores group information in the DHT
+func (m *DHTStorageManager) StoreGroupInfo(group *storage.GroupInfo) error {
+	// First store locally
+	if err := m.storage.StoreGroup(group); err != nil {
+		return err
+	}
+
+	// Determine which nodes should store this group info
+	groupKey := fmt.Sprintf("group:%s", group.ID)
+	groupHash := HashString(groupKey)
+	targetID := dht.NodeID(groupHash)
+
+	// Find the closest nodes
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+	// Serialize the group info
+	groupData, err := json.Marshal(group)
+	if err != nil {
+		return fmt.Errorf("failed to marshal group: %w", err)
+	}
+
+	// Create store message
+	storeMsg := Message{
+		Type:    CmdStoreGroupInfo,
+		Sender:  m.node.address,
+		Content: string(groupData),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Replicate to target nodes
+	for _, targetNode := range closestNodes {
+		// Skip if it's ourselves - we already stored it
+		if targetNode.ID.Equal(m.node.dht.LocalID) {
+			continue
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(targetNode.Address); ok {
+			conn.Write(msgData)
+		} else {
+			// Try to establish connection if not connected
+			if conn, err := net.Dial("tcp", targetNode.Address); err == nil {
+				conn.Write(msgData)
+				m.node.peersMutex.Lock()
+				m.node.peers[targetNode.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchGroupInfo fetches group information from the network
+func (m *DHTStorageManager) FetchGroupInfo(groupID string) (*storage.GroupInfo, error) {
+	// Try local storage first
+	group, err := m.storage.GetGroup(groupID)
+	if err == nil {
+		return group, nil
+	}
+
+	// Not found locally, search the network
+	groupKey := fmt.Sprintf("group:%s", groupID)
+	targetID := dht.NodeID(HashString(groupKey))
+
+	// Find nodes that might have this group info
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create find group request
+	findReq := Message{
+		Type:    CmdFindGroupInfo,
+		Sender:  m.node.address,
+		Content: groupID,
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Set up response channel
+	responseChan := make(chan *storage.GroupInfo, 1)
+
+	// Track queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Query each node
+	for _, node := range closestNodes {
+		// Skip if it's ourselves - we already checked
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		go func(nodeAddr string) {
+			// Try to get existing connection
+			if conn, ok := m.node.getPeerByAddress(nodeAddr); ok {
+				conn.Write(reqData)
+			} else {
+				// Try to establish connection
+				if conn, err := net.Dial("tcp", nodeAddr); err == nil {
+					conn.Write(reqData)
+					m.node.peersMutex.Lock()
+					m.node.peers[nodeAddr] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}(node.Address)
+	}
+
+	// Wait for response or timeout
+	select {
+	case group := <-responseChan:
+		return group, nil
+	case <-time.After(5 * time.Second):
+		// Check local storage one more time before giving up
+		// Another handler might have stored it
+		group, err := m.storage.GetGroup(groupID)
+		if err == nil {
+			return group, nil
+		}
+
+		return nil, fmt.Errorf("group not found in network")
+	}
+}
+
+// FetchUserGroups fetches all groups a user is a member of from the network
+func (m *DHTStorageManager) FetchUserGroups(userID string) []*storage.GroupInfo {
+	// Create lookup key
+	userGroupsKey := fmt.Sprintf("user:%s:groups", userID)
+	targetID := dht.NodeID(HashString(userGroupsKey))
+
+	// Find nodes that might have group info for this user
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create request message
+	findReq := Message{
+		Type:    CmdFindUserGroups,
+		Sender:  m.node.address,
+		Content: userID,
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Keep track of queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Query each node
+	for _, node := range closestNodes {
+		// Skip if it's ourselves or already queried
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		// Send request
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.Write(reqData)
+		} else {
+			// Try to establish connection if not connected
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.Write(reqData)
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	// Wait a short time for responses (would be better with proper async handling)
+	time.Sleep(500 * time.Millisecond)
+
+	// Return local groups (which might have been updated by responses)
+	groups, _ := m.storage.GetUserGroups(userID)
+	return groups
+}
+
+// StoreGroupMessage stores a message for a group and ensures it's delivered to all members
+func (m *DHTStorageManager) StoreGroupMessage(content *storage.EncryptedContent, members []string) error {
+	// Store the message in local storage
+	if err := m.storage.StoreGroupMessage(content); err != nil {
+		return err
+	}
+
+	// Generate global message key
+	groupMsgKey := fmt.Sprintf("groupmsg:%s:%s", content.GroupID, content.ID)
+
+	// Store in local DHT
+	contentData, _ := json.Marshal(content)
+	m.node.dht.StoreValue(groupMsgKey, string(contentData))
+
+	// Determine which nodes should store this content for each member
+	for _, memberID := range members {
+		// Skip the sender - they already have it
+		if memberID == content.SenderID {
+			continue
+		}
+
+		// Create member-specific content key
+		memberKey := fmt.Sprintf("content:%s:%s", memberID, content.ID)
+		memberHash := HashString(memberKey)
+		targetID := dht.NodeID(memberHash)
+
+		// Find nodes that should store this content for this member
+		closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+		// Create store message
+		storeMsg := Message{
+			Type:    CmdStoreContent,
+			Sender:  m.node.address,
+			Content: string(contentData),
+		}
+		msgData, _ := json.Marshal(storeMsg)
+
+		// Replicate to target nodes
+		for _, targetNode := range closestNodes {
+			// Skip if it's ourselves - we already stored it
+			if targetNode.ID.Equal(m.node.dht.LocalID) {
+				continue
+			}
+
+			// Send to node
+			if conn, ok := m.node.getPeerByAddress(targetNode.Address); ok {
+				conn.Write(msgData)
+			} else {
+				// Try to establish connection if not connected
+				if conn, err := net.Dial("tcp", targetNode.Address); err == nil {
+					conn.Write(msgData)
+					m.node.peersMutex.Lock()
+					m.node.peers[targetNode.Address] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchGroupMessages fetches messages for a group from the network
+func (m *DHTStorageManager) FetchGroupMessages(groupID string) []*storage.EncryptedContent {
+	// Create lookup key
+	groupMsgsKey := fmt.Sprintf("group:%s:messages", groupID)
+	targetID := dht.NodeID(HashString(groupMsgsKey))
+
+	// Find nodes that might have messages for this group
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create request message
+	findReq := Message{
+		Type:    CmdFindGroupMessages,
+		Sender:  m.node.address,
+		Content: groupID,
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Keep track of queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Query each node
+	for _, node := range closestNodes {
+		// Skip if it's ourselves or already queried
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		// Send request
+		if conn, ok := m.node.getPeerByAddress(node.Address); ok {
+			conn.Write(reqData)
+		} else {
+			// Try to establish connection if not connected
+			if conn, err := net.Dial("tcp", node.Address); err == nil {
+				conn.Write(reqData)
+				m.node.peersMutex.Lock()
+				m.node.peers[node.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	// Wait a short time for responses
+	time.Sleep(500 * time.Millisecond)
+
+	// Return local messages (which might have been updated by responses)
+	messages, _ := m.storage.GetGroupMessages(groupID, 0)
+	return messages
+}

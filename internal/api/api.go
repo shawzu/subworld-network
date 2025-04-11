@@ -93,6 +93,15 @@ func (api *NodeAPI) StartServer() error {
 	mux.HandleFunc("/voice/fetch", api.handleFetchVoiceStream)
 	mux.HandleFunc("/voice/end", api.handleEndVoiceCall)
 
+	mux.HandleFunc("/groups/create", api.handleCreateGroup)
+	mux.HandleFunc("/groups/get", api.handleGetGroup)
+	mux.HandleFunc("/groups/list", api.handleListGroups)
+	mux.HandleFunc("/groups/join", api.handleJoinGroup)
+	mux.HandleFunc("/groups/leave", api.handleLeaveGroup)
+	mux.HandleFunc("/groups/members", api.handleGroupMembers)
+	mux.HandleFunc("/groups/messages/send", api.handleSendGroupMessage)
+	mux.HandleFunc("/groups/messages/get", api.handleGetGroupMessages)
+
 	// CORS middleware
 	handler := corsMiddleware(mux)
 
@@ -121,6 +130,426 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Handler for creating a new group
+func (api *NodeAPI) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request
+	var request struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Creator     string   `json:"creator"`          // The user's public key
+		Members     []string `json:"members"`          // Initial members (optional)
+		Avatar      string   `json:"avatar,omitempty"` // Optional avatar (file ID)
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if request.Name == "" || request.Creator == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Create the group
+	group := &storage.GroupInfo{
+		ID:          fmt.Sprintf("group-%d", time.Now().UnixNano()),
+		Name:        request.Name,
+		Description: request.Description,
+		Creator:     request.Creator,
+		Members:     append([]string{request.Creator}, request.Members...),
+		Admins:      []string{request.Creator}, // Creator is always an admin
+		Created:     time.Now(),
+		Updated:     time.Now(),
+		Avatar:      request.Avatar,
+	}
+
+	// Store the group
+	if err := api.storage.StoreGroup(group); err != nil {
+		http.Error(w, "Failed to store group: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Also add group membership indexes for all members
+	for _, member := range group.Members {
+		api.storage.StoreGroupMemberIndex(member, group.ID)
+	}
+
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Store the group info in the DHT so other nodes can discover it
+	groupKey := fmt.Sprintf("group:%s", group.ID)
+	groupData, _ := json.Marshal(group)
+	api.node.StoreDHTValue(groupKey, string(groupData))
+
+	// Distribute the group info to appropriate nodes
+	storageManager.StoreGroupInfo(group)
+
+	// Return success with group ID
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"id":     group.ID,
+	})
+}
+
+// Handler for getting a specific group
+func (api *NodeAPI) handleGetGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get group ID from query
+	groupID := r.URL.Query().Get("group_id")
+	if groupID == "" {
+		http.Error(w, "Missing group_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Create a DHT storage manager for network operations
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch group from network first
+	group, err := storageManager.FetchGroupInfo(groupID)
+	if err != nil {
+		// Fall back to local storage
+		group, err = api.storage.GetGroup(groupID)
+		if err != nil {
+			http.Error(w, "Group not found", http.StatusNotFound)
+			return
+		}
+	}
+
+	// Return the group info
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(group)
+}
+
+// Handler for listing user's groups
+func (api *NodeAPI) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get user ID from query
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Create a DHT storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch all groups for this user from the network
+	storageManager.FetchUserGroups(userID)
+
+	// Get the groups from local storage (which may have been updated by network fetch)
+	groups, err := api.storage.GetUserGroups(userID)
+	if err != nil {
+		http.Error(w, "Failed to get groups: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return the groups
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(groups)
+}
+
+// Handler for joining a group
+func (api *NodeAPI) handleJoinGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request
+	var request struct {
+		GroupID string `json:"group_id"`
+		UserID  string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if request.GroupID == "" || request.UserID == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Create a DHT storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch the group first to ensure we have the latest version
+	_, err := storageManager.FetchGroupInfo(request.GroupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Add the user to the group
+	if err := api.storage.AddUserToGroup(request.GroupID, request.UserID); err != nil {
+		http.Error(w, "Failed to add user to group: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Get the updated group and distribute to the network
+	updatedGroup, _ := api.storage.GetGroup(request.GroupID)
+	storageManager.StoreGroupInfo(updatedGroup)
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+	})
+}
+
+// Handler for leaving a group
+func (api *NodeAPI) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request
+	var request struct {
+		GroupID string `json:"group_id"`
+		UserID  string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if request.GroupID == "" || request.UserID == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Remove the user from the group
+	if err := api.storage.RemoveUserFromGroup(request.GroupID, request.UserID); err != nil {
+		http.Error(w, "Failed to remove user from group: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Get the updated group and distribute to the network
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+	updatedGroup, _ := api.storage.GetGroup(request.GroupID)
+	storageManager.StoreGroupInfo(updatedGroup)
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+	})
+}
+
+// Handler for getting group members
+func (api *NodeAPI) handleGroupMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get group ID from query
+	groupID := r.URL.Query().Get("group_id")
+	if groupID == "" {
+		http.Error(w, "Missing group_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Get the group
+	group, err := api.storage.GetGroup(groupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Return the members
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"group_id": groupID,
+		"members":  group.Members,
+		"admins":   group.Admins,
+	})
+}
+
+// Handler for sending a message to a group
+func (api *NodeAPI) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request body
+	var content storage.EncryptedContent
+	if err := json.NewDecoder(r.Body).Decode(&content); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields
+	if content.GroupID == "" || content.SenderID == "" || content.EncryptedData == "" {
+		http.Error(w, "Missing required fields", http.StatusBadRequest)
+		return
+	}
+
+	// Set content type and group flag
+	content.Type = storage.TypeGroupMessage
+	content.IsGroupMsg = true
+
+	// Generate ID if not provided
+	if content.ID == "" {
+		content.ID = fmt.Sprintf("grpmsg-%d", time.Now().UnixNano())
+	}
+
+	// Set timestamp if not provided
+	if content.Timestamp.IsZero() {
+		content.Timestamp = time.Now()
+	}
+
+	// Get the group to verify membership and distribute to members
+	group, err := api.storage.GetGroup(content.GroupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify the sender is a member of the group
+	isMember := false
+	for _, member := range group.Members {
+		if member == content.SenderID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		http.Error(w, "Sender is not a member of the group", http.StatusForbidden)
+		return
+	}
+
+	// Create a DHT storage manager to handle distribution
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Store the message
+	err = storageManager.StoreGroupMessage(&content, group.Members)
+	if err != nil {
+		http.Error(w, "Failed to store message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"id":     content.ID,
+	})
+}
+
+// Handler for getting group messages
+func (api *NodeAPI) handleGetGroupMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get parameters
+	groupID := r.URL.Query().Get("group_id")
+	if groupID == "" {
+		http.Error(w, "Missing group_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "Missing user_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Get the group to verify membership
+	group, err := api.storage.GetGroup(groupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify the requester is a member of the group
+	isMember := false
+	for _, member := range group.Members {
+		if member == userID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		http.Error(w, "User is not a member of the group", http.StatusForbidden)
+		return
+	}
+
+	// Get optional parameters
+	sinceStr := r.URL.Query().Get("since")
+	limitStr := r.URL.Query().Get("limit")
+
+	var since time.Time
+	if sinceStr != "" {
+		timestamp, err := strconv.ParseInt(sinceStr, 10, 64)
+		if err == nil {
+			since = time.Unix(timestamp, 0)
+		}
+	}
+
+	limit := 100 // Default
+	if limitStr != "" {
+		parsedLimit, err := strconv.Atoi(limitStr)
+		if err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	// Create a DHT storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Try to fetch messages from the network
+	storageManager.FetchGroupMessages(groupID)
+
+	// Get messages from local storage (which may have been updated by the network fetch)
+	messages, err := api.storage.GetGroupMessages(groupID, limit)
+	if err != nil {
+		http.Error(w, "Failed to get messages: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter by timestamp
+	if !since.IsZero() {
+		var filteredMessages []*storage.EncryptedContent
+		for _, msg := range messages {
+			if msg.Timestamp.After(since) {
+				filteredMessages = append(filteredMessages, msg)
+			}
+		}
+		messages = filteredMessages
+	}
+
+	// Return messages
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
 }
 
 // Logging middleware to log API requests
