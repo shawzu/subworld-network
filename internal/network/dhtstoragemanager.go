@@ -1012,6 +1012,130 @@ func (m *DHTStorageManager) StoreGroupMessage(content *storage.EncryptedContent,
 	return nil
 }
 
+// StoreGroupFile stores a file for a group and ensures it's distributed to members
+func (m *DHTStorageManager) StoreGroupFile(file *storage.EncryptedContent, members []string) error {
+	// Store locally first
+	if err := m.storage.StoreContent(file); err != nil {
+		return err
+	}
+
+	// Generate global file key
+	groupFileKey := fmt.Sprintf("groupfile:%s:%s:%d", file.GroupID, file.ID, file.ChunkIndex)
+	fileHash := HashString(groupFileKey)
+	targetID := dht.NodeID(fileHash)
+
+	// Store in local DHT
+	fileData, _ := json.Marshal(file)
+	m.node.dht.StoreValue(groupFileKey, string(fileData))
+
+	// Find closest nodes to store this file
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor)
+
+	// Create store message
+	storeMsg := Message{
+		Type:    CmdStoreContent,
+		Sender:  m.node.address,
+		Content: string(fileData),
+	}
+	msgData, _ := json.Marshal(storeMsg)
+
+	// Distribute to target nodes (for DHT-based access)
+	for _, targetNode := range closestNodes {
+		if targetNode.ID.Equal(m.node.dht.LocalID) {
+			continue // Skip ourselves
+		}
+
+		// Send to node
+		if conn, ok := m.node.getPeerByAddress(targetNode.Address); ok {
+			conn.Write(msgData)
+		} else {
+			// Try to establish connection
+			if conn, err := net.Dial("tcp", targetNode.Address); err == nil {
+				conn.Write(msgData)
+				m.node.peersMutex.Lock()
+				m.node.peers[targetNode.Address] = conn
+				m.node.peersMutex.Unlock()
+				go m.node.handlePeer(conn)
+			}
+		}
+	}
+
+	return nil
+}
+
+// FetchGroupFile tries to find a group file across the network
+func (m *DHTStorageManager) FetchGroupFile(groupID, fileID string, chunkIndex int) (*storage.EncryptedContent, error) {
+	// Try local storage first
+	files, err := m.storage.GetGroupFiles(groupID)
+	if err == nil {
+		for _, file := range files {
+			if file.ID == fileID && file.ChunkIndex == chunkIndex {
+				// Ensure we have data in both fields for compatibility
+				if len(file.RawData) == 0 && file.EncryptedData != "" {
+					file.RawData = []byte(file.EncryptedData)
+				} else if file.EncryptedData == "" && len(file.RawData) > 0 {
+					file.EncryptedData = string(file.RawData)
+				}
+				return file, nil
+			}
+		}
+	}
+
+	// Not found locally, search the network
+	groupFileKey := fmt.Sprintf("groupfile:%s:%s:%d", groupID, fileID, chunkIndex)
+	targetID := dht.NodeID(HashString(groupFileKey))
+
+	// Find nodes that might have this file
+	closestNodes := m.node.dht.FindClosestNodes(targetID, ReplicationFactor*2)
+
+	// Create find file request
+	findReq := Message{
+		Type:    CmdFindGroupFile,
+		Sender:  m.node.address,
+		Content: fmt.Sprintf("%s:%s:%d", groupID, fileID, chunkIndex),
+	}
+	reqData, _ := json.Marshal(findReq)
+
+	// Track queried nodes
+	queriedNodes := make(map[string]bool)
+
+	// Set up channel for results
+	resultChan := make(chan *storage.EncryptedContent, 1)
+
+	// Query each node
+	for _, node := range closestNodes {
+		if node.ID.Equal(m.node.dht.LocalID) || queriedNodes[node.Address] {
+			continue
+		}
+
+		queriedNodes[node.Address] = true
+
+		go func(nodeAddr string) {
+			if conn, ok := m.node.getPeerByAddress(nodeAddr); ok {
+				conn.Write(reqData)
+			} else {
+				if conn, err := net.Dial("tcp", nodeAddr); err == nil {
+					conn.Write(reqData)
+					m.node.peersMutex.Lock()
+					m.node.peers[nodeAddr] = conn
+					m.node.peersMutex.Unlock()
+					go m.node.handlePeer(conn)
+				}
+			}
+		}(node.Address)
+	}
+
+	// Wait for result or timeout
+	select {
+	case result := <-resultChan:
+		// Store locally for future queries
+		m.storage.StoreContent(result)
+		return result, nil
+	case <-time.After(2 * time.Second):
+		return nil, fmt.Errorf("group file not found in network")
+	}
+}
+
 // FetchGroupMessages fetches messages for a group from the network
 func (m *DHTStorageManager) FetchGroupMessages(groupID string) []*storage.EncryptedContent {
 	// Create lookup key

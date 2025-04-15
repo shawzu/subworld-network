@@ -102,6 +102,9 @@ func (api *NodeAPI) StartServer() error {
 	mux.HandleFunc("/groups/messages/send", api.handleSendGroupMessage)
 	mux.HandleFunc("/groups/messages/get", api.handleGetGroupMessages)
 
+	mux.HandleFunc("/groups/files/upload", api.handleGroupFileUpload)
+	mux.HandleFunc("/groups/files/get", api.handleGetGroupFile)
+
 	// CORS middleware
 	handler := corsMiddleware(mux)
 
@@ -200,6 +203,321 @@ func (api *NodeAPI) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		"status": "success",
 		"id":     group.ID,
 	})
+}
+
+// handleGroupFileUpload handles a client request to upload a file to a group
+func (api *NodeAPI) handleGroupFileUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fmt.Println("Group file upload request received")
+
+	// Limit upload size
+	r.Body = http.MaxBytesReader(w, r.Body, api.maxUploadSizeMB*1024*1024)
+
+	// Parse multipart form
+	err := r.ParseMultipartForm(api.maxUploadSizeMB * 1024 * 1024)
+	if err != nil {
+		fmt.Printf("Failed to parse form: %v\n", err)
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get form values
+	groupID := r.FormValue("group_id")
+	senderID := r.FormValue("sender_id")
+	contentID := r.FormValue("content_id")
+	fileName := r.FormValue("file_name")
+	fileType := r.FormValue("file_type")
+	chunkIndexStr := r.FormValue("chunk_index")
+	totalChunksStr := r.FormValue("total_chunks")
+
+	fmt.Printf("Group file upload data: group=%s, sender=%s, id=%s, name=%s\n",
+		groupID, senderID, contentID, fileName)
+
+	if groupID == "" || senderID == "" {
+		fmt.Println("Missing required parameters")
+		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the sender is a member of the group
+	group, err := api.storage.GetGroup(groupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Check if sender is a member of the group
+	isMember := false
+	for _, member := range group.Members {
+		if member == senderID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		http.Error(w, "Not a member of the group", http.StatusForbidden)
+		return
+	}
+
+	// Generate content ID if not provided
+	if contentID == "" {
+		contentID = fmt.Sprintf("groupfile-%d", time.Now().UnixNano())
+	}
+
+	// Parse chunk info
+	chunkIndex := 0
+	totalChunks := 1
+	if chunkIndexStr != "" {
+		chunkIndex, _ = strconv.Atoi(chunkIndexStr)
+	}
+	if totalChunksStr != "" {
+		totalChunks, _ = strconv.Atoi(totalChunksStr)
+	}
+
+	// Get file
+	file, fileHeader, err := r.FormFile("file")
+	if err != nil {
+		fmt.Printf("Failed to get file: %v\n", err)
+		http.Error(w, "Failed to get file: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	fmt.Printf("Received file: %s, size: %d bytes\n", fileHeader.Filename, fileHeader.Size)
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		fmt.Printf("Failed to read file: %v\n", err)
+		http.Error(w, "Failed to read file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("Read %d bytes of file data\n", len(data))
+
+	// Create content for metadata if first chunk
+	if chunkIndex == 0 {
+		metaContent := &storage.EncryptedContent{
+			ID:            contentID,
+			SenderID:      senderID,
+			GroupID:       groupID, // Use GroupID instead of RecipientID
+			IsGroupMsg:    true,    // Mark as group content
+			Type:          storage.TypeFile,
+			EncryptedData: "", // Metadata only
+			Timestamp:     time.Now(),
+			TotalChunks:   totalChunks,
+			ChunkIndex:    -1, // Special value for metadata
+			FileName:      fileName,
+			FileType:      fileType,
+			FileSize:      fileHeader.Size,
+		}
+
+		// Create storage manager
+		storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+		// Store metadata with distribution
+		fmt.Println("Storing group file metadata in DHT")
+		if err := storageManager.StoreGroupFile(metaContent, group.Members); err != nil {
+			fmt.Printf("Failed to store group file metadata: %v\n", err)
+			http.Error(w, "Failed to store group file metadata: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Create content
+	content := &storage.EncryptedContent{
+		ID:            contentID,
+		SenderID:      senderID,
+		GroupID:       groupID, // Use GroupID instead of RecipientID
+		IsGroupMsg:    true,    // Mark as group content
+		Type:          storage.TypeFile,
+		EncryptedData: string(data),
+		RawData:       data,
+		Timestamp:     time.Now(),
+		ChunkIndex:    chunkIndex,
+		TotalChunks:   totalChunks,
+		FileName:      fileName,
+		FileType:      fileType,
+		FileSize:      fileHeader.Size,
+	}
+
+	// Create storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// Store the file chunk with distributed replication
+	fmt.Printf("Storing group file chunk %d of %d in DHT\n", chunkIndex, totalChunks)
+	if err := storageManager.StoreGroupFile(content, group.Members); err != nil {
+		fmt.Printf("Failed to store group file: %v\n", err)
+		http.Error(w, "Failed to store group file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Println("Group file stored successfully")
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":      "success",
+		"id":          contentID,
+		"chunk_index": fmt.Sprintf("%d", chunkIndex),
+	})
+}
+
+// handleGetGroupFile handles a client request to retrieve a file from a group
+func (api *NodeAPI) handleGetGroupFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get parameters
+	userID := r.URL.Query().Get("user_id")
+	groupID := r.URL.Query().Get("group_id")
+	fileID := r.URL.Query().Get("file_id")
+	chunkStr := r.URL.Query().Get("chunk")
+
+	fmt.Printf("Group file get request: user=%s, group=%s, file=%s, chunk=%s\n",
+		userID, groupID, fileID, chunkStr)
+
+	if userID == "" || groupID == "" || fileID == "" {
+		fmt.Println("Missing required parameters")
+		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the user is a member of the group
+	group, err := api.storage.GetGroup(groupID)
+	if err != nil {
+		http.Error(w, "Group not found", http.StatusNotFound)
+		return
+	}
+
+	// Check if user is a member of the group
+	isMember := false
+	for _, member := range group.Members {
+		if member == userID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		http.Error(w, "Not a member of the group", http.StatusForbidden)
+		return
+	}
+
+	// Create storage manager
+	storageManager := network.NewDHTStorageManager(api.node, api.storage)
+
+	// If chunk is specified, get just that chunk
+	if chunkStr != "" {
+		chunkIndex, err := strconv.Atoi(chunkStr)
+		if err != nil {
+			fmt.Printf("Invalid chunk index: %v\n", err)
+			http.Error(w, "Invalid chunk index", http.StatusBadRequest)
+			return
+		}
+
+		// Try to fetch the file from the network
+		fmt.Printf("Fetching group file chunk %d from network\n", chunkIndex)
+		file, err := storageManager.FetchGroupFile(groupID, fileID, chunkIndex)
+		if err != nil {
+			fmt.Printf("Chunk not found: %v\n", err)
+			http.Error(w, "Chunk not found", http.StatusNotFound)
+			return
+		}
+
+		// Check and log data sizes
+		fmt.Printf("Found group file chunk %d, rawData size: %d bytes, encryptedData size: %d bytes\n",
+			chunkIndex, len(file.RawData), len(file.EncryptedData))
+
+		// Set content type if available
+		if file.FileType != "" {
+			w.Header().Set("Content-Type", file.FileType)
+		} else {
+			w.Header().Set("Content-Type", "application/octet-stream")
+		}
+
+		// Set filename for download
+		if file.FileName != "" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, file.FileName))
+		} else {
+			w.Header().Set("Content-Disposition", "attachment")
+		}
+
+		// Send data - try RawData first, fall back to EncryptedData
+		if len(file.RawData) > 0 {
+			fmt.Printf("Writing %d bytes of RawData\n", len(file.RawData))
+			w.Write(file.RawData)
+		} else if file.EncryptedData != "" {
+			fmt.Printf("Writing %d bytes from EncryptedData\n", len(file.EncryptedData))
+			w.Write([]byte(file.EncryptedData))
+		} else {
+			fmt.Println("WARNING: No data available for file chunk")
+			http.Error(w, "File chunk has no data", http.StatusInternalServerError)
+			return
+		}
+		return
+	}
+
+	// If no chunk specified, return metadata
+	// Get file content - try local first
+	files, err := api.storage.GetGroupFiles(groupID)
+	if err != nil {
+		http.Error(w, "Failed to get group files: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Find the requested file metadata
+	var fileMeta *storage.EncryptedContent
+	for _, content := range files {
+		if content.ID == fileID && content.ChunkIndex == -1 {
+			// This is the metadata
+			fileMeta = content
+			break
+		}
+	}
+
+	if fileMeta == nil {
+		// Try to find any chunk to get metadata
+		for _, content := range files {
+			if content.ID == fileID {
+				fileMeta = &storage.EncryptedContent{
+					ID:          content.ID,
+					SenderID:    content.SenderID,
+					GroupID:     content.GroupID,
+					IsGroupMsg:  true,
+					Type:        storage.TypeFile,
+					Timestamp:   content.Timestamp,
+					TotalChunks: content.TotalChunks,
+					ChunkIndex:  -1, // Metadata
+					FileName:    content.FileName,
+					FileType:    content.FileType,
+					FileSize:    content.FileSize,
+				}
+				break
+			}
+		}
+
+		if fileMeta == nil {
+			// Try to fetch from network
+			file, err := storageManager.FetchGroupFile(groupID, fileID, -1)
+			if err != nil {
+				http.Error(w, "File not found", http.StatusNotFound)
+				return
+			}
+			fileMeta = file
+		}
+	}
+
+	// Return metadata
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(fileMeta)
 }
 
 // Handler for getting a specific group

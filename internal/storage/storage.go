@@ -808,3 +808,40 @@ func (s *NodeStorage) PutRawValue(key, value []byte) error {
 func (s *NodeStorage) DeleteRawValue(key []byte) error {
 	return s.db.Delete(key, nil)
 }
+
+// GetGroupFiles retrieves all files for a group
+func (s *NodeStorage) GetGroupFiles(groupID string) ([]*EncryptedContent, error) {
+	var files []*EncryptedContent
+
+	// Use a prefix scan for content with matching group ID and type file
+	iter := s.db.NewIterator(nil, nil)
+	defer iter.Release()
+
+	for iter.Next() {
+		// Parse the content
+		var content EncryptedContent
+		if err := json.Unmarshal(iter.Value(), &content); err != nil {
+			continue
+		}
+
+		// Check if this is a file for the specified group
+		if content.Type == TypeFile && content.GroupID == groupID && content.IsGroupMsg {
+			// Skip deleted files
+			if !content.Deleted {
+				// Ensure we have data in both fields for compatibility
+				if len(content.RawData) == 0 && content.EncryptedData != "" {
+					content.RawData = []byte(content.EncryptedData)
+				} else if content.EncryptedData == "" && len(content.RawData) > 0 {
+					content.EncryptedData = string(content.RawData)
+				}
+				files = append(files, &content)
+			}
+		}
+	}
+
+	if err := iter.Error(); err != nil {
+		return files, fmt.Errorf("error iterating over group files: %w", err)
+	}
+
+	return files, nil
+}

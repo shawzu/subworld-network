@@ -54,6 +54,9 @@ const (
 	CmdUserGroupsResult    = "USER_GROUPS_RESULT"
 	CmdFindGroupMessages   = "FIND_GROUP_MESSAGES"
 	CmdGroupMessagesResult = "GROUP_MESSAGES_RESULT"
+
+	CmdFindGroupFile   = "FIND_GROUP_FILE"
+	CmdGroupFileResult = "GROUP_FILE_RESULT"
 )
 
 // NodeConfig contains the configuration for a node
@@ -2010,4 +2013,68 @@ func (n *Node) handleGroupMessagesResult(msg Message) {
 // StoreDHTValue stores a value in the node's DHT
 func (n *Node) StoreDHTValue(key string, value string) {
 	n.dht.StoreValue(key, value)
+}
+
+// handleFindGroupFile handles requests to find a group file
+func (n *Node) handleFindGroupFile(conn net.Conn, msg Message) {
+	// Parse parameters
+	parts := strings.Split(msg.Content, ":")
+	if len(parts) != 3 {
+		return
+	}
+
+	groupID := parts[0]
+	fileID := parts[1]
+	chunkIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+
+	// Look up in local storage
+	if n.storage == nil {
+		return
+	}
+
+	files, err := n.storage.GetGroupFiles(groupID)
+	if err != nil {
+		return
+	}
+
+	// Find matching file
+	for _, file := range files {
+		if file.ID == fileID && file.ChunkIndex == chunkIndex {
+			// Found it, send back
+			fileData, err := json.Marshal(file)
+			if err != nil {
+				return
+			}
+
+			response := Message{
+				Type:    CmdGroupFileResult,
+				Sender:  n.address,
+				Content: string(fileData),
+			}
+
+			responseData, _ := json.Marshal(response)
+			conn.Write(responseData)
+			return
+		}
+	}
+}
+
+// handleGroupFileResult handles group file lookup results
+func (n *Node) handleGroupFileResult(conn net.Conn, msg Message) {
+	// Parse result
+	var file storage.EncryptedContent
+	if err := json.Unmarshal([]byte(msg.Content), &file); err != nil {
+		fmt.Printf("Invalid group file result: %v\n", err)
+		return
+	}
+
+	// Store locally
+	if n.storage != nil {
+		n.storage.StoreContent(&file)
+		fmt.Printf("Received group file %s chunk %d for group %s from %s\n",
+			file.ID, file.ChunkIndex, file.GroupID, msg.Sender)
+	}
 }
