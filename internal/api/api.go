@@ -105,6 +105,8 @@ func (api *NodeAPI) StartServer() error {
 	mux.HandleFunc("/groups/files/upload", api.handleGroupFileUpload)
 	mux.HandleFunc("/groups/files/get", api.handleGetGroupFile)
 
+	mux.HandleFunc("/maintenance/cleanup_expired", api.handleCleanupExpired)
+
 	// CORS middleware
 	handler := corsMiddleware(mux)
 
@@ -1462,6 +1464,38 @@ func (api *NodeAPI) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Parse TTL and expires_at form values if provided
+	ttlStr := r.FormValue("ttl")
+	expiresAtStr := r.FormValue("expires_at")
+
+	var ttl int64
+	var expiresAt time.Time
+
+	if ttlStr != "" {
+		parsedTTL, err := strconv.ParseInt(ttlStr, 10, 64)
+		if err == nil && parsedTTL > 0 {
+			ttl = parsedTTL
+			// Calculate expiry time if not provided
+			if expiresAtStr == "" {
+				expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
+			}
+		}
+	}
+
+	if expiresAtStr != "" {
+		parsedTime, err := time.Parse(time.RFC3339, expiresAtStr)
+		if err == nil {
+			expiresAt = parsedTime
+			// Calculate TTL if not provided
+			if ttlStr == "" {
+				duration := expiresAt.Sub(time.Now())
+				if duration > 0 {
+					ttl = int64(duration.Seconds())
+				}
+			}
+		}
+	}
+
 	// Create content
 	content := &storage.EncryptedContent{
 		ID:          contentID,
@@ -1478,6 +1512,8 @@ func (api *NodeAPI) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		FileName:    fileName,
 		FileType:    fileType,
 		FileSize:    fileHeader.Size,
+		TTL:         ttl,
+		ExpiresAt:   expiresAt,
 	}
 	// Create storage manager
 	storageManager := network.NewDHTStorageManager(api.node, api.storage)
@@ -1999,6 +2035,30 @@ func (api *NodeAPI) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": "ok",
+		"time":   time.Now().Format(time.RFC3339),
+	})
+}
+
+// handleCleanupExpired handles requests to clean up expired content
+func (api *NodeAPI) handleCleanupExpired(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fmt.Println("Processing cleanup of expired content")
+
+	// Perform the cleanup operation
+	if err := api.storage.CleanupExpiredContent(); err != nil {
+		http.Error(w, "Failed to clean up expired content: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return success with timestamp
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
 		"time":   time.Now().Format(time.RFC3339),
 	})
 }

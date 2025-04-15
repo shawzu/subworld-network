@@ -769,3 +769,21 @@
 =============== Apr 15, 2025 (CEST) ===============
 02:00:21.709174 db@close closing
 02:00:21.709695 db@close done T·520.6µs
+=============== Apr 15, 2025 (CEST) ===============
+02:20:52.223108 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+02:20:52.233034 version@stat F·[0 2] S·3MiB[0B 3MiB] Sc·[0.00 0.04]
+02:20:52.233034 db@open opening
+02:20:52.233034 journal@recovery F·1
+02:20:52.234131 journal@recovery recovering @32
+02:20:52.236813 memdb@flush created L0@35 N·75 S·3KiB "gro..400,v1122":"msg..772,v1114"
+02:20:52.237332 version@stat F·[1 2] S·3MiB[3KiB 3MiB] Sc·[0.25 0.04]
+02:20:52.242535 db@janitor F·5 G·0
+02:20:52.242535 db@open done T·9.5006ms
+02:23:45.105053 table@compaction L0·1 -> L1·1 S·949KiB Q·1214
+02:23:45.111850 table@build created L1@38 N·781 S·948KiB "fil..:00,v1012":"msg..162,v767"
+02:23:45.111850 version@stat F·[0 2] S·3MiB[0B 3MiB] Sc·[0.00 0.04]
+02:23:45.112364 table@compaction committed F-1 S-943B Ke·0 D·51 T·7.3111ms
+02:23:45.112879 table@remove removed @35
+02:23:45.112879 table@remove removed @34
+03:02:44.102339 db@close closing
+03:02:44.102869 db@close done T·529.2µs

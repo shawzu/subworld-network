@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -108,6 +109,24 @@ func (s *NodeStorage) StoreContent(content *EncryptedContent) error {
 		content.EncryptedData = string(content.RawData)
 	} else if content.EncryptedData != "" && len(content.RawData) == 0 {
 		content.RawData = []byte(content.EncryptedData)
+	}
+
+	// Process TTL and expiry information
+	if content.TTL > 0 {
+		// If TTL is provided but no expiry time, calculate it
+		if content.ExpiresAt.IsZero() {
+			content.ExpiresAt = time.Now().Add(time.Duration(content.TTL) * time.Second)
+		}
+	} else if !content.ExpiresAt.IsZero() {
+		// If expiry time is provided but no TTL, calculate it
+		duration := content.ExpiresAt.Sub(time.Now())
+		if duration > 0 {
+			content.TTL = int64(duration.Seconds())
+		} else {
+			// If expiry time is in the past, use a default small TTL
+			content.TTL = 60 // 1 minute
+			content.ExpiresAt = time.Now().Add(time.Minute)
+		}
 	}
 
 	// Set expiry time for signals
@@ -724,39 +743,62 @@ func (s *NodeStorage) PermanentlyDeleteContent(userID string, contentIDs []strin
 	return nil
 }
 
-// CleanupExpiredContent removes expired content (like call signals and voice streams)
+// CleanupExpiredContent removes expired content
 func (s *NodeStorage) CleanupExpiredContent() error {
 	now := time.Now()
+	expiredCount := 0
 
-	// Find expired call signals
-	iter := s.db.NewIterator(util.BytesPrefix([]byte("signal:")), nil)
+	// Find expired content using both TTL and ExpiresAt
+	iter := s.db.NewIterator(nil, nil)
+	keysToDelete := make([][]byte, 0)
+
 	for iter.Next() {
-		var content EncryptedContent
-		if err := json.Unmarshal(iter.Value(), &content); err != nil {
+		key := iter.Key()
+		value := iter.Value()
+
+		// Skip processing if key doesn't look like content key
+		if !bytes.Contains(key, []byte("msg:")) &&
+			!bytes.Contains(key, []byte("photo:")) &&
+			!bytes.Contains(key, []byte("file:")) &&
+			!bytes.Contains(key, []byte("voice:")) &&
+			!bytes.Contains(key, []byte("signal:")) {
 			continue
 		}
 
-		// Delete if expired
+		// Try to decode the content
+		var content EncryptedContent
+		if err := json.Unmarshal(value, &content); err != nil {
+			continue
+		}
+
+		// Check if content has explicit expiry time set
 		if !content.ExpiresAt.IsZero() && content.ExpiresAt.Before(now) {
-			s.db.Delete(iter.Key(), nil)
+			keysToDelete = append(keysToDelete, key)
+			expiredCount++
+			continue
+		}
+
+		// If no explicit expiry but has TTL, calculate expiry based on creation time
+		if content.TTL > 0 && !content.Timestamp.IsZero() {
+			expiryTime := content.Timestamp.Add(time.Duration(content.TTL) * time.Second)
+			if expiryTime.Before(now) {
+				keysToDelete = append(keysToDelete, key)
+				expiredCount++
+			}
 		}
 	}
 	iter.Release()
 
-	// Find expired voice streams (they expire much faster than other content)
-	voiceIter := s.db.NewIterator(util.BytesPrefix([]byte("voice:")), nil)
-	for voiceIter.Next() {
-		var content EncryptedContent
-		if err := json.Unmarshal(voiceIter.Value(), &content); err != nil {
-			continue
-		}
-
-		// Voice streams expire after 60 seconds by default
-		if time.Since(content.Timestamp) > 60*time.Second {
-			s.db.Delete(voiceIter.Key(), nil)
+	// Delete all expired content
+	for _, key := range keysToDelete {
+		if err := s.db.Delete(key, nil); err != nil {
+			fmt.Printf("Error deleting expired content key %s: %v\n", string(key), err)
 		}
 	}
-	voiceIter.Release()
+
+	if expiredCount > 0 {
+		fmt.Printf("Cleaned up %d expired content items\n", expiredCount)
+	}
 
 	return nil
 }
