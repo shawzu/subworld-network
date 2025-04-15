@@ -460,7 +460,7 @@ func (n *Node) acceptConnections() {
 	}
 }
 
-// handlePeer handles communication with a peer
+// / handlePeer handles communication with a peer
 func (n *Node) handlePeer(conn net.Conn) {
 	defer func() {
 		conn.Close()
@@ -537,6 +537,11 @@ func (n *Node) handlePeer(conn net.Conn) {
 			n.handleFindGroupMessages(conn, msg)
 		case CmdGroupMessagesResult:
 			n.handleGroupMessagesResult(msg)
+
+		case CmdFindGroupFile:
+			n.handleFindGroupFile(conn, msg)
+		case CmdGroupFileResult:
+			n.handleGroupFileResult(conn, msg)
 		default:
 			fmt.Printf("Unknown message type: %s\n", msg.Type)
 		}
