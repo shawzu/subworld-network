@@ -787,3 +787,13 @@
 02:23:45.112879 table@remove removed @34
 03:02:44.102339 db@close closing
 03:02:44.102869 db@close done T·529.2µs
+=============== Apr 16, 2025 (CEST) ===============
+03:01:14.861457 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+03:01:14.869285 CURRENT: missing target file: MANIFEST-000037
+03:01:14.875458 CURRENT.bak: missing target file: MANIFEST-000033
+03:01:14.879968 db@open opening
+03:01:14.881010 version@stat F·[] S·0B[] Sc·[]
+03:01:14.882050 db@janitor F·2 G·0
+03:01:14.882050 db@open done T·2.0817ms
+03:05:50.662729 db@close closing
+03:05:50.662729 db@close done T·0s

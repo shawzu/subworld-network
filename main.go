@@ -33,9 +33,7 @@ func main() {
 
 	// Bootstrap node configuration
 	bootstrapNodes := []string{
-		"93.4.27.35", // Primary bootstrap node
 		"167.71.11.170",
-		"178.62.199.31",
 	}
 
 	// Create node configuration
