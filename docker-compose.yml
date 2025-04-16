@@ -1,0 +1,19 @@
+
+version: '3.8'
+services:
+  subworld-node:
+    build: .
+    container_name: subworld-node
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # P2P port
+      - "8081:8081"  # API port
+    volumes:
+      - ./data:/data  # Persist node data
+    command: 
+      - "./subworld-network"
+      - "-datadir=/data"
+      #- "-bootstrap=true"
+      # - "-apiport=8081"
+      # - "-storage=20"
+
