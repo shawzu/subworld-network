@@ -42,6 +42,3 @@ docker-compose up -d
 - [Subworld Client](https://github.com/shawzu/subworld-client): Client application for accessing the Subworld network
 - [Subworld Proxy](https://github.com/shawzu/proxy-sw): Proxy server for the Subworld network
 
-## License
-
-[MIT](LICENSE)
