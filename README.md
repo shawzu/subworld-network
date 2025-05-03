@@ -1,6 +1,6 @@
 # Subworld Network
 
-Core infrastructure for the Subworld decentralized network.
+Core infrastructure for the Subworld decentralized network. (DHT Kamdemlia like)
 
 ## Installation
 
